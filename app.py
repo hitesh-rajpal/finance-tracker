@@ -782,11 +782,12 @@ with tab_rules:
         result_df = pd.DataFrame(rows_out)
 
         def _status_color(val):
-            return {
-                "Matched": "background-color: #1e4620",
-                "Mismatch": "background-color: #5c3a0d",
-                "Missing": "background-color: #5c1a1a",
-            }.get(val, "")
+            base = "color: white; font-weight: 600; "
+            return base + {
+                "Matched": "background-color: #1e7a34",
+                "Mismatch": "background-color: #b06a1a",
+                "Missing": "background-color: #b02a2a",
+            }.get(val, "background-color: #555; ")
 
         st.dataframe(
             result_df.drop(columns=["_id"]).style.map(_status_color, subset=["Status"]),
