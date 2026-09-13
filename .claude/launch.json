@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "finance-tracker",
+      "runtimeExecutable": "C:\\Users\\hp\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+      "runtimeArgs": ["-m", "streamlit", "run", "C:\\Users\\hp\\Downloads\\finance-tracker\\app.py", "--server.port", "5189", "--server.headless", "true"],
+      "port": 5189
+    }
+  ]
+}
