@@ -647,7 +647,12 @@ with tab_review:
             f"Known so far: {', '.join(known_parties) if known_parties else '(none yet)'}. "
             "Delete a row with the trash icon on its left, then Save."
         )
-        show_uncat_only = st.checkbox("Show only Uncategorized", value=True)
+        show_uncat_only = st.checkbox(
+            "Show only Uncategorized",
+            value=False,
+            help="Off by default so statement uploads with a bank-given category (or an "
+                 "auto-matched one) still show up here for you to review and correct.",
+        )
         view = df[df["category"] == "Uncategorized"] if show_uncat_only else df
         editable = view[["id", "date", "amount", "direction", "account", "bank",
                           "description", "category", "parties", "source", "source_file", "edit_source"]].copy()
