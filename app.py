@@ -176,6 +176,17 @@ def storage_cfg():
     return st.secrets.get("supabase_storage")
 
 
+def one_indexed(df: pd.DataFrame) -> pd.DataFrame:
+    """Row numbers starting at 1 instead of pandas' default 0-based index —
+    also works around a real Streamlit quirk: hide_index=True silently does
+    nothing on a data_editor with num_rows='dynamic' unless the index is
+    already a clean range, so this doubles as that fix wherever it's used
+    on an editable table."""
+    df = df.reset_index(drop=True)
+    df.index = df.index + 1
+    return df
+
+
 def save_rows(rows: list[dict], raw_file: tuple[str, bytes, str] | None = None) -> tuple[int, int]:
     """Normalizes rows, skips ones that match an already-recorded transaction
     (by shared reference number, else amount+direction+date), and saves the
@@ -381,9 +392,8 @@ with tab_upload:
                 st.warning("Couldn't detect a transaction table in this PDF. "
                            "It may be a scanned/image PDF — try exporting a text-based statement instead.")
                 continue
-            st.caption(f"Extracted {len(df)} row(s) total — showing the first 15 below, "
-                       "but all of them are used when you click Add transactions.")
-            st.dataframe(df.head(15), use_container_width=True, height=200)
+            st.caption(f"Extracted {len(df)} row(s), numbered 1-{len(df)} below.")
+            st.dataframe(one_indexed(df), use_container_width=True, height=400)
             mapping_guess = statement_parser.guess_column_mapping(df)
             cols = ["-- none --"] + list(df.columns)
 
@@ -484,9 +494,8 @@ with tab_upload:
             if df.empty:
                 st.warning("Couldn't detect a trade table in this PDF.")
                 continue
-            st.caption(f"Extracted {len(df)} row(s) total — showing the first 15 below, "
-                       "but all of them are used when you click Add trades.")
-            st.dataframe(df.head(15), use_container_width=True, height=200)
+            st.caption(f"Extracted {len(df)} row(s), numbered 1-{len(df)} below.")
+            st.dataframe(one_indexed(df), use_container_width=True, height=400)
             if meta.get("net_settlement"):
                 st.caption(f"Detected net settlement amount: {meta['net_settlement']:,.2f} "
                            f"on {meta.get('trade_date', 'unknown date')} — match this against your bank statement.")
@@ -574,8 +583,8 @@ with tab_uploads_log:
                 st.markdown(f"**✅ Saved (new) — {len(saved_rows)}:**")
                 if saved_rows:
                     st.dataframe(
-                        pd.DataFrame(saved_rows)[["date", "amount", "direction", "category", "description"]],
-                        use_container_width=True, hide_index=True,
+                        one_indexed(pd.DataFrame(saved_rows)[["date", "amount", "direction", "category", "description"]]),
+                        use_container_width=True,
                     )
                 elif b["saved_count"]:
                     st.caption(f"{b['saved_count']} row(s) were saved here originally but have since been "
@@ -646,8 +655,9 @@ with tab_review:
         editable = editable.rename(columns={
             "source": "linked from", "source_file": "upload file", "edit_source": "how it was set",
         })
+        editable = one_indexed(editable)
         edited = st.data_editor(
-            editable, use_container_width=True, hide_index=True, key="editor",
+            editable, use_container_width=True, key="editor",
             disabled=["id", "date", "amount", "direction", "account", "bank", "description",
                       "linked from", "upload file", "how it was set"],
             num_rows="dynamic",
