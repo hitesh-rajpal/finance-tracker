@@ -378,6 +378,8 @@ with tab_upload:
                 st.warning("Couldn't detect a transaction table in this PDF. "
                            "It may be a scanned/image PDF — try exporting a text-based statement instead.")
                 continue
+            st.caption(f"Extracted {len(df)} row(s) total — showing the first 15 below, "
+                       "but all of them are used when you click Add transactions.")
             st.dataframe(df.head(15), use_container_width=True, height=200)
             mapping_guess = statement_parser.guess_column_mapping(df)
             cols = ["-- none --"] + list(df.columns)
@@ -446,6 +448,8 @@ with tab_upload:
             if df.empty:
                 st.warning("Couldn't detect a trade table in this PDF.")
                 continue
+            st.caption(f"Extracted {len(df)} row(s) total — showing the first 15 below, "
+                       "but all of them are used when you click Add trades.")
             st.dataframe(df.head(15), use_container_width=True, height=200)
             if meta.get("net_settlement"):
                 st.caption(f"Detected net settlement amount: {meta['net_settlement']:,.2f} "
