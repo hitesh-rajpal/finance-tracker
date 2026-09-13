@@ -645,6 +645,8 @@ with tab_review:
             "going forward. Parties is who this relates to — 'Office' drives the office-expense reports, "
             "but you can add any name (comma-separated for more than one, e.g. 'Ram, Sham'). "
             f"Known so far: {', '.join(known_parties) if known_parties else '(none yet)'}. "
+            "Particulars is a free note. Month defaults to the transaction's YYYYMM but can be changed "
+            "(e.g. to book a late-cycle statement entry into the next month). "
             "Delete a row with the trash icon on its left, then Save."
         )
         show_uncat_only = st.checkbox(
@@ -655,10 +657,13 @@ with tab_review:
         )
         view = df[df["category"] == "Uncategorized"] if show_uncat_only else df
         editable = view[["id", "date", "amount", "direction", "account", "bank",
-                          "description", "category", "parties", "source", "source_file", "edit_source"]].copy()
+                          "description", "category", "parties", "particulars", "month_tag",
+                          "source", "source_file", "edit_source"]].copy()
         editable["parties"] = editable["parties"].apply(lambda ps: ", ".join(ps))
+        editable["month_tag"] = editable["month_tag"].fillna(editable["date"].dt.strftime("%Y%m"))
         editable = editable.rename(columns={
             "source": "linked from", "source_file": "upload file", "edit_source": "how it was set",
+            "particulars": "Particulars", "month_tag": "Month",
         })
         editable = one_indexed(editable)
         edited = st.data_editor(
@@ -677,7 +682,9 @@ with tab_review:
                 is_office = any(p.lower() == "office" for p in parties)
                 for p in parties:
                     ensure_party(p)
-                update_transaction(row["id"], row["category"], is_office, parties)
+                particulars = None if pd.isna(row["Particulars"]) else str(row["Particulars"]).strip() or None
+                month_tag = None if pd.isna(row["Month"]) else str(row["Month"]).strip() or None
+                update_transaction(row["id"], row["category"], is_office, parties, particulars, month_tag)
                 apply_correction(row["description"], row["category"], is_office)
                 changed += 1
             msg = f"Updated {changed} rows."
@@ -708,8 +715,11 @@ with tab_review:
                                          key="quick_assign_multiselect")
                 if st.button("Set parties for this transaction", key="quick_assign_save"):
                     is_office = any(p.lower() == "office" for p in chosen)
-                    row_category = view.loc[view["id"] == picked_id, "category"].iloc[0]
-                    update_transaction(picked_id, row_category, is_office, chosen)
+                    picked_row = view.loc[view["id"] == picked_id].iloc[0]
+                    picked_particulars = None if pd.isna(picked_row["particulars"]) else picked_row["particulars"]
+                    picked_month = None if pd.isna(picked_row["month_tag"]) else picked_row["month_tag"]
+                    update_transaction(picked_id, picked_row["category"], is_office, chosen,
+                                        picked_particulars, picked_month)
                     st.success(f"Parties set to: {', '.join(chosen) if chosen else '(none)'}.")
                     st.rerun()
 

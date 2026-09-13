@@ -42,12 +42,16 @@ CREATE TABLE IF NOT EXISTS transactions (
     account_key TEXT,                 -- normalized join key into account_master
     parties TEXT[],                   -- who this relates to: 'Office', 'Brother', 'Ram', 'Sham', ... (0, 1, or many)
     edit_source TEXT,                 -- how category/parties were set: 'sms_tag' | 'bank_category' | 'auto' | 'manual'
-    upload_batch_id TEXT              -- which upload this row came from (upload_batches.id)
+    upload_batch_id TEXT,             -- which upload this row came from (upload_batches.id)
+    particulars TEXT,                 -- freeform note, editable in Review & Categorize
+    month_tag TEXT                    -- 'YYYYMM', defaults from date but editable (e.g. to book a late-cycle txn into the next month)
 );
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS account_key TEXT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS parties TEXT[];
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS edit_source TEXT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS upload_batch_id TEXT;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS particulars TEXT;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS month_tag TEXT;
 
 CREATE TABLE IF NOT EXISTS category_overrides (
     description_key TEXT PRIMARY KEY,  -- normalized merchant/description snippet
@@ -209,16 +213,21 @@ def upsert_transactions(rows: list[dict]) -> int:
                 r.setdefault("parties", None)
                 r.setdefault("edit_source", None)
                 r.setdefault("upload_batch_id", None)
+                r.setdefault("particulars", None)
+                if not r.get("month_tag"):
+                    date_val = r.get("date")
+                    r["month_tag"] = str(date_val).replace("-", "")[:6] if date_val else None
                 cur.execute(
                     """INSERT INTO transactions
                        (id, date, amount, direction, account, bank, description,
                         category, is_office, source, source_file, raw_text,
                         scrip, quantity, price, charges, account_key, parties,
-                        edit_source, upload_batch_id)
+                        edit_source, upload_batch_id, particulars, month_tag)
                        VALUES (%(id)s, %(date)s, %(amount)s, %(direction)s, %(account)s,
                         %(bank)s, %(description)s, %(category)s, %(is_office)s, %(source)s,
                         %(source_file)s, %(raw_text)s, %(scrip)s, %(quantity)s, %(price)s,
-                        %(charges)s, %(account_key)s, %(parties)s, %(edit_source)s, %(upload_batch_id)s)
+                        %(charges)s, %(account_key)s, %(parties)s, %(edit_source)s, %(upload_batch_id)s,
+                        %(particulars)s, %(month_tag)s)
                        ON CONFLICT (id) DO NOTHING""",
                     r,
                 )
@@ -248,13 +257,14 @@ def get_batch_transactions(batch_id: str) -> list[dict]:
             return cur.fetchall()
 
 
-def update_transaction(txn_id: str, category: str, is_office: bool, parties: list[str] | None = None):
+def update_transaction(txn_id: str, category: str, is_office: bool, parties: list[str] | None = None,
+                        particulars: str | None = None, month_tag: str | None = None):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE transactions SET category = %s, is_office = %s, parties = %s, edit_source = 'manual' "
-                "WHERE id = %s",
-                (category, is_office, parties, txn_id),
+                "UPDATE transactions SET category = %s, is_office = %s, parties = %s, particulars = %s, "
+                "month_tag = %s, edit_source = 'manual' WHERE id = %s",
+                (category, is_office, parties, particulars, month_tag, txn_id),
             )
 
 
