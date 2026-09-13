@@ -66,11 +66,21 @@ def _score_header_row(cells: list[str]) -> int:
     return score
 
 
-def extract_raw_table(pdf_bytes: bytes) -> pd.DataFrame:
+class PasswordRequired(Exception):
+    """Raised when a PDF can't be opened — either it's password-protected,
+    or genuinely corrupt/unsupported; the caller can't tell which without
+    trying a password, so the UI offers one either way."""
+
+
+def extract_raw_table(pdf_bytes: bytes, password: str | None = None) -> pd.DataFrame:
     """Best-effort extraction of the transaction table across all pages."""
     all_rows = []
     header = None
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+    try:
+        pdf_ctx = pdfplumber.open(io.BytesIO(pdf_bytes), password=password)
+    except Exception as e:
+        raise PasswordRequired(str(e)) from e
+    with pdf_ctx as pdf:
         for page in pdf.pages:
             tables = page.extract_tables()
             for table in tables:

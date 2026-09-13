@@ -14,6 +14,7 @@ from core.storage import (
     save_rate_change, get_rate_changes, delete_rate_change,
     save_upload_batch, get_upload_batches, save_upload_matches, get_upload_matches,
     delete_upload_batch, get_batch_transactions,
+    save_pdf_password, get_pdf_passwords, delete_pdf_password,
 )
 from core.categorize import categorize, apply_correction, is_office_for_category
 from core import reports
@@ -259,6 +260,58 @@ def save_rows(rows: list[dict], raw_file: tuple[str, bytes, str] | None = None) 
     return n, len(matched)
 
 
+def handle_password_protected_pdf(f, extract_fn, saved_passwords):
+    """extract_fn(password) -> result, raising statement_parser.PasswordRequired
+    on a wrong/missing password. Returns the result once extraction succeeds,
+    or None while the password-entry UI is showing (caller should skip this
+    file for the rest of this rerun in that case)."""
+    pw_state_key = f"pw_ok_{f.name}"
+
+    def _try(password=None):
+        try:
+            return extract_fn(password), None
+        except statement_parser.PasswordRequired:
+            return None, "needs_password"
+
+    result, err = _try(st.session_state.get(pw_state_key))
+    if not err:
+        if st.session_state.get(pw_state_key):
+            st.caption("🔓 Opened with a saved/entered password.")
+        return result
+
+    st.warning("This PDF needs a password to open.")
+    pw_options = ["-- type a new password --"] + [p["label"] for p in saved_passwords]
+    choice = st.selectbox("Use a saved password", pw_options, key=f"pwchoice_{f.name}")
+    if choice != "-- type a new password --":
+        match = next(p for p in saved_passwords if p["label"] == choice)
+        result, err = _try(match["password"])
+        if not err:
+            st.session_state[pw_state_key] = match["password"]
+            st.rerun()
+        else:
+            st.error("That saved password didn't work for this file.")
+        return None
+
+    typed_pw = st.text_input("PDF password", type="password", key=f"pwtype_{f.name}")
+    label_input = st.text_input(
+        "Save this password for future statements as",
+        value=f.name.rsplit(".", 1)[0], key=f"pwlabel_{f.name}",
+        help="Next month's statement from this same source — pick this label from the dropdown "
+             "instead of retyping the password.",
+    )
+    if st.button("Try this password", key=f"pwtry_{f.name}") and typed_pw:
+        result, err = _try(typed_pw)
+        if err:
+            st.error("Incorrect password.")
+        else:
+            st.session_state[pw_state_key] = typed_pw
+            save_label = label_input.strip() or f.name.rsplit(".", 1)[0]
+            save_pdf_password(save_label, typed_pw)
+            st.success(f"Password worked — saved as '{save_label}' for next time.")
+            st.rerun()
+    return None
+
+
 if storage_cfg() and not st.session_state.get("_bucket_ensured"):
     file_storage.ensure_bucket(storage_cfg()["url"], storage_cfg()["service_role_key"])
     st.session_state["_bucket_ensured"] = True
@@ -307,10 +360,15 @@ with tab_upload:
     st.subheader("Bank statement PDFs")
     stmt_files = st.file_uploader("Statement PDF(s)", type=["pdf"],
                                    accept_multiple_files=True, key="stmt_upl")
+    saved_passwords = get_pdf_passwords()
     for f in stmt_files or []:
         with st.expander(f"📄 {f.name}", expanded=True):
             raw_bytes = f.getvalue()
-            df = statement_parser.extract_raw_table(raw_bytes)
+            df = handle_password_protected_pdf(
+                f, lambda pw: statement_parser.extract_raw_table(raw_bytes, password=pw), saved_passwords
+            )
+            if df is None:
+                continue
             if df.empty:
                 st.warning("Couldn't detect a transaction table in this PDF. "
                            "It may be a scanned/image PDF — try exporting a text-based statement instead.")
@@ -374,7 +432,12 @@ with tab_upload:
     for f in cn_files or []:
         with st.expander(f"📄 {f.name}", expanded=True):
             raw_bytes = f.getvalue()
-            df, meta = contract_note_parser.extract_trade_table(raw_bytes)
+            result = handle_password_protected_pdf(
+                f, lambda pw: contract_note_parser.extract_trade_table(raw_bytes, password=pw), saved_passwords
+            )
+            if result is None:
+                continue
+            df, meta = result
             if df.empty:
                 st.warning("Couldn't detect a trade table in this PDF.")
                 continue

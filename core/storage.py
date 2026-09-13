@@ -74,6 +74,18 @@ CREATE TABLE IF NOT EXISTS party_master (
     name TEXT PRIMARY KEY
 );
 
+-- Passwords for password-protected statement PDFs (common for Indian bank/
+-- credit-card statements), keyed by a label you choose (e.g. "BPCL SBI
+-- Card") so next month's statement from the same source can reuse it
+-- instead of asking again. Stored in plaintext — this is inherent to the
+-- feature (the app needs to hand the literal password to the PDF reader
+-- each time) and no different in kind from the DB/API credentials already
+-- held in this same database; it's only ever read back by this app.
+CREATE TABLE IF NOT EXISTS pdf_password_master (
+    label TEXT PRIMARY KEY,
+    password TEXT NOT NULL
+);
+
 -- Things you EXPECT to happen (savings interest at a rate, credit-card
 -- cashback at a rate, a home/personal loan EMI on its amortization
 -- schedule, or any other fixed recurring transfer to/from a bank,
@@ -341,6 +353,29 @@ def rename_party(old_name: str, new_name: str):
             )
             cur.execute("DELETE FROM party_master WHERE name = %s", (old_name,))
             cur.execute("INSERT INTO party_master (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (new_name,))
+
+
+def save_pdf_password(label: str, password: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO pdf_password_master (label, password) VALUES (%s, %s)
+                   ON CONFLICT (label) DO UPDATE SET password = EXCLUDED.password""",
+                (label, password),
+            )
+
+
+def get_pdf_passwords() -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM pdf_password_master ORDER BY label")
+            return cur.fetchall()
+
+
+def delete_pdf_password(label: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM pdf_password_master WHERE label = %s", (label,))
 
 
 def save_override(description_key: str, category: str, is_office: bool):

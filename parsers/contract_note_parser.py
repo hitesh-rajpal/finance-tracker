@@ -13,7 +13,7 @@ import pdfplumber
 import pandas as pd
 from dateutil import parser as dateparser
 
-from parsers.statement_parser import _parse_amount, _score_header_row  # reuse
+from parsers.statement_parser import _parse_amount, _score_header_row, PasswordRequired  # reuse
 
 TRADE_HEADER_HINTS = {
     "scrip": ["security", "symbol", "scrip", "company"],
@@ -31,11 +31,15 @@ NET_SETTLEMENT_RE = re.compile(
 NOTE_DATE_RE = re.compile(r"(?:trade date|contract date)\s*[:\-]?\s*([0-9]{1,2}[-/][A-Za-z0-9]{2,4}[-/]?[0-9]{0,4})", re.IGNORECASE)
 
 
-def extract_trade_table(pdf_bytes: bytes) -> tuple[pd.DataFrame, dict]:
+def extract_trade_table(pdf_bytes: bytes, password: str | None = None) -> tuple[pd.DataFrame, dict]:
     all_rows = []
     header = None
     full_text = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+    try:
+        pdf_ctx = pdfplumber.open(io.BytesIO(pdf_bytes), password=password)
+    except Exception as e:
+        raise PasswordRequired(str(e)) from e
+    with pdf_ctx as pdf:
         for page in pdf.pages:
             full_text.append(page.extract_text() or "")
             for table in page.extract_tables():
