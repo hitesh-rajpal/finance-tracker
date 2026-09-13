@@ -305,6 +305,28 @@ def get_party_master() -> list[str]:
             return [r[0] for r in cur.fetchall()]
 
 
+def delete_party(name: str):
+    """Removes a name from the master list only — does not touch any
+    transaction that already references it in its parties array."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM party_master WHERE name = %s", (name,))
+
+
+def rename_party(old_name: str, new_name: str):
+    """Renames in the master list AND backfills every transaction whose
+    parties array references the old name, so relabeling doesn't orphan
+    past transactions the way it would if we only touched party_master."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE transactions SET parties = array_replace(parties, %s, %s) WHERE %s = ANY(parties)",
+                (old_name, new_name, old_name),
+            )
+            cur.execute("DELETE FROM party_master WHERE name = %s", (old_name,))
+            cur.execute("INSERT INTO party_master (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (new_name,))
+
+
 def save_override(description_key: str, category: str, is_office: bool):
     with get_conn() as conn:
         with conn.cursor() as cur:

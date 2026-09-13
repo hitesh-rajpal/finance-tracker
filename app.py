@@ -10,7 +10,7 @@ import streamlit as st
 from core.storage import (
     init_db, upsert_transactions, fetch_all, make_txn_id, delete_transactions, delete_all,
     ensure_account, get_account_master, update_account, update_transaction,
-    save_rule, get_rules, delete_rule, ensure_party, get_party_master,
+    save_rule, get_rules, delete_rule, ensure_party, get_party_master, delete_party, rename_party,
     save_upload_batch, get_upload_batches, save_upload_matches, get_upload_matches,
     delete_upload_batch, get_batch_transactions,
 )
@@ -152,9 +152,10 @@ def save_rows(rows: list[dict]) -> tuple[int, int]:
 st.title("Office Expenses, Bank & Trading Tracker")
 st.caption("Data is stored in your private Supabase project — accessible only with the app password.")
 
-tab_upload, tab_uploads_log, tab_review, tab_accounts, tab_reports, tab_trading, tab_recon, tab_rules = st.tabs(
-    ["📥 Upload", "📁 Uploads", "🏷️ Review & Categorize", "🏦 Accounts", "📊 Reports", "📈 Trading",
-     "🔗 Reconciliation", "🎯 Expected & Cross-Check"]
+(tab_upload, tab_uploads_log, tab_review, tab_accounts, tab_parties, tab_reports, tab_trading,
+ tab_recon, tab_rules) = st.tabs(
+    ["📥 Upload", "📁 Uploads", "🏷️ Review & Categorize", "🏦 Accounts", "🎭 Parties", "📊 Reports",
+     "📈 Trading", "🔗 Reconciliation", "🎯 Expected & Cross-Check"]
 )
 
 # ---------------------------------------------------------------- Upload ---
@@ -395,6 +396,33 @@ with tab_review:
             st.rerun()
 
         st.divider()
+        with st.expander("🎭 Quick-assign parties to one transaction (pick from master list)"):
+            st.caption(
+                "The table above uses free-text (fast for bulk edits); this picks from your saved "
+                "Parties master list instead, so there's no risk of a typo creating a near-duplicate "
+                "name. Add new names in the 🎭 Parties tab first if they're not listed yet."
+            )
+            pick_options = {
+                f"{r['date'].date()} — ₹{r['amount']:,.2f} — {r['description'][:60]}": r["id"]
+                for _, r in view.iterrows()
+            }
+            if not pick_options:
+                st.caption("No transactions in the current filter to pick from.")
+            else:
+                picked_label = st.selectbox("Transaction", list(pick_options.keys()), key="quick_assign_pick")
+                picked_id = pick_options[picked_label]
+                current = view.loc[view["id"] == picked_id, "parties"].iloc[0]
+                master_now = get_party_master()
+                chosen = st.multiselect("Parties", options=master_now, default=[p for p in current if p in master_now],
+                                         key="quick_assign_multiselect")
+                if st.button("Set parties for this transaction", key="quick_assign_save"):
+                    is_office = any(p.lower() == "office" for p in chosen)
+                    row_category = view.loc[view["id"] == picked_id, "category"].iloc[0]
+                    update_transaction(picked_id, row_category, is_office, chosen)
+                    st.success(f"Parties set to: {', '.join(chosen) if chosen else '(none)'}.")
+                    st.rerun()
+
+        st.divider()
         with st.expander("⚠️ Danger zone — delete all transactions"):
             st.caption("Useful while testing. This does not affect Account labels (Accounts tab) or "
                        "category-correction memory — only the transaction rows themselves.")
@@ -434,6 +462,43 @@ with tab_accounts:
                 update_account(row["key"], row["label"], row["account_type"])
             st.success("Account labels updated.")
             st.rerun()
+
+# -------------------------------------------------------- Parties tab -----
+with tab_parties:
+    st.caption(
+        "The master list of names a transaction's Parties can be picked from (used in Review & "
+        "Categorize). 'Office' always exists — it's what drives the office-expense reports."
+    )
+    known_parties = get_party_master()
+    c1, c2 = st.columns([3, 1])
+    new_party = c1.text_input("Add a new party", placeholder="e.g. Brother, Ram, Sham", key="new_party_input")
+    if c2.button("Add", key="add_party_btn") and new_party.strip():
+        ensure_party(new_party.strip())
+        st.success(f"Added '{new_party.strip()}'.")
+        st.rerun()
+
+    if not known_parties:
+        st.info("No parties yet — add one above, or tag a transaction with one in Review & Categorize.")
+    else:
+        df_all = load_df()
+        counts = reports.party_breakdown(df_all) if not df_all.empty else pd.DataFrame()
+        count_map = dict(zip(counts["party"], counts["count"])) if not counts.empty else {}
+        for name in known_parties:
+            c1, c2, c3 = st.columns([3, 2, 1])
+            c1.write(f"**{name}**")
+            c2.caption(f"{count_map.get(name, 0)} transaction(s)")
+            if name.lower() != "office" and c3.button("Remove", key=f"rm_party_{name}"):
+                delete_party(name)
+                st.success(f"Removed '{name}' from the list (past transactions keep the tag).")
+                st.rerun()
+
+        with st.expander("Rename a party (updates past transactions too)"):
+            rename_from = st.selectbox("Rename", known_parties, key="rename_from")
+            rename_to = st.text_input("To", key="rename_to")
+            if st.button("Rename", key="rename_btn") and rename_to.strip():
+                rename_party(rename_from, rename_to.strip())
+                st.success(f"Renamed '{rename_from}' to '{rename_to.strip()}' everywhere.")
+                st.rerun()
 
 # -------------------------------------------------------- Reports tab -----
 with tab_reports:
