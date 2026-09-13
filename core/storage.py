@@ -103,6 +103,17 @@ CREATE TABLE IF NOT EXISTS financial_rules (
     active BOOLEAN DEFAULT TRUE
 );
 
+-- Rate resets for a floating-rate Loan EMI rule. At each effective_date, the
+-- EMI is recalculated on the outstanding balance at that point (for
+-- whatever tenure remains), matching the usual bank convention of a fixed
+-- payoff date with an adjusting installment amount.
+CREATE TABLE IF NOT EXISTS loan_rate_changes (
+    id TEXT PRIMARY KEY,
+    rule_id TEXT NOT NULL,
+    effective_date DATE NOT NULL,
+    new_annual_rate DOUBLE PRECISION NOT NULL
+);
+
 -- One row per "Parse & save" / "Add transactions" click, so you can see
 -- exactly what you uploaded and when, and delete a whole upload's worth of
 -- transactions in one go.
@@ -422,3 +433,29 @@ def delete_rule(rule_id: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM financial_rules WHERE id = %s", (rule_id,))
+            cur.execute("DELETE FROM loan_rate_changes WHERE rule_id = %s", (rule_id,))
+
+
+def save_rate_change(change: dict):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO loan_rate_changes (id, rule_id, effective_date, new_annual_rate)
+                   VALUES (%(id)s, %(rule_id)s, %(effective_date)s, %(new_annual_rate)s)""",
+                change,
+            )
+
+
+def get_rate_changes(rule_id: str) -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM loan_rate_changes WHERE rule_id = %s ORDER BY effective_date", (rule_id,)
+            )
+            return cur.fetchall()
+
+
+def delete_rate_change(change_id: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM loan_rate_changes WHERE id = %s", (change_id,))

@@ -11,6 +11,7 @@ from core.storage import (
     init_db, upsert_transactions, fetch_all, make_txn_id, delete_transactions, delete_all,
     ensure_account, get_account_master, update_account, update_transaction,
     save_rule, get_rules, delete_rule, ensure_party, get_party_master, delete_party, rename_party,
+    save_rate_change, get_rate_changes, delete_rate_change,
     save_upload_batch, get_upload_batches, save_upload_matches, get_upload_matches,
     delete_upload_batch, get_batch_transactions,
 )
@@ -99,15 +100,17 @@ def save_rows(rows: list[dict]) -> tuple[int, int]:
         else:
             if not has_is_office:
                 r["is_office"] = is_office_for_category(r["category"])
-            r["edit_source"] = "sms_tag" if r.get("source") == "sms" else (
-                "bank_category" if r.get("source") == "statement" else "auto"
+            r["edit_source"] = "manual" if r.get("source") == "manual" else (
+                "sms_tag" if r.get("source") == "sms" else (
+                    "bank_category" if r.get("source") == "statement" else "auto"
+                )
             )
         r["is_office"] = bool(r.get("is_office"))
         if not r.get("parties"):
             r["parties"] = ["Office"] if r["is_office"] else []
         for p in r["parties"]:
             ensure_party(p)
-        for k in ("account", "bank", "source_file", "scrip"):
+        for k in ("account", "bank", "source_file", "scrip", "raw_text"):
             r.setdefault(k, None)
         for k in ("quantity", "price", "charges"):
             r.setdefault(k, None)
@@ -294,6 +297,35 @@ with tab_upload:
                     msg += f" {skipped} already matched an existing trade row and were not duplicated."
                 msg += " See the 📁 Uploads tab for the itemized list."
                 st.success(msg)
+
+    st.divider()
+    st.subheader("Cash / manual entry")
+    st.caption("For anything with no SMS or statement trail — cash spend, or a correction you know by hand.")
+    with st.form("manual_entry_form", clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        m_date = c1.date_input("Date", value=date.today())
+        m_amount = c2.number_input("Amount (₹)", min_value=0.0, step=10.0)
+        m_direction = c3.selectbox("Direction", ["debit", "credit"])
+        c1, c2 = st.columns(2)
+        m_desc = c1.text_input("Description", placeholder="e.g. Auto fare, cash paid")
+        m_category = c2.text_input("Category (optional — leave blank to auto-suggest)")
+        if st.form_submit_button("Add cash transaction"):
+            if not m_desc.strip():
+                st.error("Add a description first.")
+            else:
+                row = {
+                    "date": m_date.isoformat(), "amount": float(m_amount), "direction": m_direction,
+                    "description": m_desc.strip(), "source": "manual", "source_file": "cash entry",
+                    "bank": "Cash", "account": "Cash",
+                }
+                if m_category.strip():
+                    row["category"] = m_category.strip()
+                n, skipped = save_rows([row])
+                if n:
+                    st.success("Added.")
+                elif skipped:
+                    st.warning("This matched an existing transaction and wasn't added as a duplicate.")
+                st.rerun()
 
 # --------------------------------------------------------- Uploads tab ----
 with tab_uploads_log:
@@ -688,7 +720,12 @@ with tab_rules:
         rows_out = []
         for rule in rules:
             period_start, period_end = fr.period_bounds(rule.get("frequency") or "Monthly", target_month)
-            result = fr.cross_check(rule, df, period_start, period_end)
+            rc = None
+            if rule["rule_type"] == "Loan EMI" and rule.get("start_date"):
+                stored_changes = get_rate_changes(rule["id"])
+                if stored_changes:
+                    rc = fr.rate_changes_for_schedule(rule["start_date"], stored_changes)
+            result = fr.cross_check(rule, df, period_start, period_end, rate_changes=rc)
             rows_out.append({
                 "Name": rule["name"],
                 "Type": rule["rule_type"],
@@ -717,9 +754,33 @@ with tab_rules:
         for rule in rules:
             if rule["rule_type"] == "Loan EMI" and rule.get("principal") and rule.get("tenure_months"):
                 with st.expander(f"📐 Amortization schedule — {rule['name']}"):
+                    stored_changes = get_rate_changes(rule["id"])
+                    if stored_changes:
+                        st.markdown("**Rate changes on record:**")
+                        for c in stored_changes:
+                            cc1, cc2 = st.columns([5, 1])
+                            cc1.write(f"{c['effective_date']}: → {c['new_annual_rate']}%")
+                            if cc2.button("Remove", key=f"rm_rate_{c['id']}"):
+                                delete_rate_change(c["id"])
+                                st.rerun()
+                    with st.form(key=f"add_rate_change_{rule['id']}"):
+                        st.caption("Record a floating-rate reset — the EMI recalculates on the balance "
+                                   "at that date for whatever tenure remains, keeping the original payoff date.")
+                        c1, c2 = st.columns(2)
+                        eff_date = c1.date_input("Effective from", key=f"eff_date_{rule['id']}")
+                        new_rate = c2.number_input("New annual rate %", min_value=0.0, step=0.1,
+                                                    format="%.2f", key=f"new_rate_{rule['id']}")
+                        if st.form_submit_button("Add rate change"):
+                            save_rate_change({
+                                "id": uuid.uuid4().hex[:16], "rule_id": rule["id"],
+                                "effective_date": eff_date, "new_annual_rate": new_rate,
+                            })
+                            st.rerun()
+
+                    rc = fr.rate_changes_for_schedule(rule["start_date"], stored_changes) if stored_changes else None
                     schedule = fr.amortization_schedule(
                         rule["principal"], rule.get("annual_rate") or 0,
-                        int(rule["tenure_months"]), rule["start_date"],
+                        int(rule["tenure_months"]), rule["start_date"], rate_changes=rc,
                     )
                     st.dataframe(schedule, use_container_width=True, height=250)
 
