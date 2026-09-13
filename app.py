@@ -357,8 +357,10 @@ with tab_upload:
         st.success(msg)
 
     st.divider()
-    st.subheader("Bank statement PDFs")
-    stmt_files = st.file_uploader("Statement PDF(s)", type=["pdf"],
+    st.subheader("Bank / Credit Card statement PDFs")
+    st.caption("Same uploader for both — a savings/current account statement or a credit card statement, "
+               "any bank. You'll confirm which columns mean what after it's parsed.")
+    stmt_files = st.file_uploader("Bank or Credit Card statement PDF(s)", type=["pdf"],
                                    accept_multiple_files=True, key="stmt_upl")
     saved_passwords = get_pdf_passwords()
     for f in stmt_files or []:
@@ -511,14 +513,18 @@ with tab_uploads_log:
         "transaction it saved."
     )
     batches = get_upload_batches()
+    source_type_labels = {
+        "sms": "SMS", "statement": "Bank/Credit Card statement",
+        "contract_note": "Contract note", "manual": "Cash/manual entry",
+    }
     if not batches:
         st.info("No uploads yet.")
     else:
         for b in batches:
             title = (
                 f"{b['uploaded_at']:%Y-%m-%d %H:%M} — {b['source_file'] or '(unnamed)'} "
-                f"({b['source_type']}) — parsed {b['parsed_count']}, saved {b['saved_count']}, "
-                f"skipped {b['skipped_count']}"
+                f"({source_type_labels.get(b['source_type'], b['source_type'])}) — "
+                f"parsed {b['parsed_count']}, saved {b['saved_count']}, skipped {b['skipped_count']}"
             )
             with st.expander(title):
                 saved_rows = get_batch_transactions(b["id"]) if b["saved_count"] else []
