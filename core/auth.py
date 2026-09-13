@@ -8,8 +8,18 @@ import requests
 TIMEOUT = 10
 
 
-def sign_in(url: str, anon_key: str, email: str, password: str) -> tuple[bool, str]:
-    """Returns (success, message). On success, message is empty."""
+def _token_error(resp) -> str:
+    try:
+        detail = resp.json().get("error_description") or resp.json().get("msg") or resp.text
+    except ValueError:
+        detail = resp.text
+    return detail or "Incorrect email or password."
+
+
+def sign_in(url: str, anon_key: str, email: str, password: str) -> tuple[bool, dict | str]:
+    """Returns (success, session_dict) on success — session_dict has
+    access_token/refresh_token/user, the refresh_token being what "Remember
+    me" persists — or (False, error_message) on failure."""
     try:
         resp = requests.post(
             f"{url}/auth/v1/token?grant_type=password",
@@ -21,12 +31,28 @@ def sign_in(url: str, anon_key: str, email: str, password: str) -> tuple[bool, s
         return False, f"Could not reach the login service: {e}"
 
     if resp.status_code == 200:
-        return True, ""
+        return True, resp.json()
+    return False, _token_error(resp)
+
+
+def refresh_session(url: str, anon_key: str, refresh_token: str) -> tuple[bool, dict | str]:
+    """Silently re-authenticates using a persisted refresh_token (Remember
+    me), instead of asking for email/password again. Returns the same shape
+    as sign_in — a fresh refresh_token comes back too, since Supabase
+    rotates them on use, so the caller should re-save it."""
     try:
-        detail = resp.json().get("error_description") or resp.json().get("msg") or resp.text
-    except ValueError:
-        detail = resp.text
-    return False, detail or "Incorrect email or password."
+        resp = requests.post(
+            f"{url}/auth/v1/token?grant_type=refresh_token",
+            headers={"apikey": anon_key, "Content-Type": "application/json"},
+            json={"refresh_token": refresh_token},
+            timeout=TIMEOUT,
+        )
+    except requests.RequestException as e:
+        return False, f"Could not reach the login service: {e}"
+
+    if resp.status_code == 200:
+        return True, resp.json()
+    return False, _token_error(resp)
 
 
 def send_password_reset(url: str, anon_key: str, email: str) -> tuple[bool, str]:

@@ -21,7 +21,15 @@ from core import financial_rules as fr
 from core import auth
 from parsers import sms_parser, statement_parser, contract_note_parser
 
+try:
+    from streamlit_cookies_controller import CookieController
+except ImportError:
+    CookieController = None
+
 st.set_page_config(page_title="Finance Tracker", layout="wide")
+
+REMEMBER_COOKIE = "finance_tracker_remember_token"
+REMEMBER_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
 
 
 def _legacy_password_gate():
@@ -44,10 +52,12 @@ def _legacy_password_gate():
 
 def require_login():
     """Gates the whole app behind real Supabase Auth email/password login
-    (with a working forgot-password flow) once [supabase_auth] is set in
-    secrets; falls back to the old shared-password check until then. This
-    app is deployed to a public URL and holds bank/trading data, so nothing
-    below this check should render for an unauthenticated visitor."""
+    (with a working forgot-password flow and an optional "Remember me" that
+    persists across browser restarts via a cookie holding Supabase's
+    refresh_token) once [supabase_auth] is set in secrets; falls back to the
+    old shared-password check until then. This app is deployed to a public
+    URL and holds bank/trading data, so nothing below this check should
+    render for an unauthenticated visitor."""
     if st.session_state.get("authenticated"):
         return
 
@@ -58,18 +68,42 @@ def require_login():
         _legacy_password_gate()
         st.stop()
 
+    controller = CookieController() if CookieController else None
+
+    # Try a silent re-login from a remembered refresh token before showing
+    # the form at all. The cookie component reports its value asynchronously,
+    # so this may only succeed a rerun or two after the page first loads —
+    # that's fine, it just means a brief flash of the login form once.
+    if controller is not None and not st.session_state.get("_remember_tried"):
+        remembered = controller.get(REMEMBER_COOKIE)
+        if remembered:
+            ok, result = auth.refresh_session(auth_cfg["url"], auth_cfg["anon_key"], remembered)
+            if ok:
+                st.session_state["authenticated"] = True
+                st.session_state["user_email"] = result.get("user", {}).get("email", "")
+                new_refresh = result.get("refresh_token")
+                if new_refresh:
+                    controller.set(REMEMBER_COOKIE, new_refresh, max_age=REMEMBER_MAX_AGE)
+                st.rerun()
+        st.session_state["_remember_tried"] = True
+
     def on_submit():
         email = st.session_state.get("login_email", "").strip()
         password = st.session_state.get("login_password", "")
-        ok, msg = auth.sign_in(auth_cfg["url"], auth_cfg["anon_key"], email, password)
+        ok, result = auth.sign_in(auth_cfg["url"], auth_cfg["anon_key"], email, password)
         if ok:
             st.session_state["authenticated"] = True
-            st.session_state["user_email"] = email
+            st.session_state["user_email"] = result.get("user", {}).get("email", "")
+            if st.session_state.get("remember_me") and controller is not None:
+                controller.set(REMEMBER_COOKIE, result["refresh_token"], max_age=REMEMBER_MAX_AGE)
         else:
-            st.session_state["auth_failed"] = msg
+            st.session_state["auth_failed"] = result
 
     st.text_input("Email", key="login_email")
     st.text_input("Password", type="password", key="login_password", on_change=on_submit)
+    st.checkbox("Remember me on this device", value=True, key="remember_me",
+                disabled=controller is None,
+                help=None if controller else "Cookie support isn't installed, so this can't persist.")
     if st.button("Log in"):
         on_submit()
     if st.session_state.get("auth_failed"):
@@ -84,9 +118,25 @@ def require_login():
     st.stop()
 
 
+def render_logout():
+    """Sidebar control to end the session and forget this device, for when
+    Remember me was used and someone wants to actually log out."""
+    auth_cfg = st.secrets.get("supabase_auth")
+    with st.sidebar:
+        if st.session_state.get("user_email"):
+            st.caption(f"Logged in as {st.session_state['user_email']}")
+        if st.button("Log out"):
+            if auth_cfg and CookieController:
+                CookieController().remove(REMEMBER_COOKIE)
+            for k in ("authenticated", "user_email", "_remember_tried"):
+                st.session_state.pop(k, None)
+            st.rerun()
+
+
 require_login()
 init_db()
 ensure_party("Office")
+render_logout()
 
 
 def load_df() -> pd.DataFrame:
