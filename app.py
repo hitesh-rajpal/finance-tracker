@@ -19,6 +19,7 @@ from core.categorize import categorize, apply_correction, is_office_for_category
 from core import reports
 from core import financial_rules as fr
 from core import auth
+from core import file_storage
 from parsers import sms_parser, statement_parser, contract_note_parser
 
 try:
@@ -167,13 +168,19 @@ def account_key_and_label(bank: str | None, account: str | None) -> tuple[str | 
     return (label.lower() or None), (label or None)
 
 
-def save_rows(rows: list[dict]) -> tuple[int, int]:
+def storage_cfg():
+    return st.secrets.get("supabase_storage")
+
+
+def save_rows(rows: list[dict], raw_file: tuple[str, bytes, str] | None = None) -> tuple[int, int]:
     """Normalizes rows, skips ones that match an already-recorded transaction
     (by shared reference number, else amount+direction+date), and saves the
     rest. Returns (saved_count, skipped_as_already_recorded_count). Also logs
     an upload_batches row (what/when, with counts) and, for every skipped
     row, an upload_matches row recording exactly which existing transaction
-    it matched and why — visible in the Uploads tab."""
+    it matched and why — visible in the Uploads tab. If raw_file is given
+    (filename, bytes, content_type) and Storage is configured, the original
+    uploaded file is kept there too, linked to the batch."""
     if not rows:
         return 0, 0
 
@@ -217,6 +224,16 @@ def save_rows(rows: list[dict]) -> tuple[int, int]:
         r["upload_batch_id"] = batch_id
     n = upsert_transactions(unmatched)
 
+    file_path = None
+    scfg = storage_cfg()
+    if raw_file and scfg:
+        filename, data, content_type = raw_file
+        ok, result = file_storage.upload_file(
+            scfg["url"], scfg["service_role_key"], f"{batch_id}/{filename}", data, content_type
+        )
+        if ok:
+            file_path = result
+
     save_upload_batch({
         "id": batch_id,
         "source_file": rows[0].get("source_file"),
@@ -224,6 +241,7 @@ def save_rows(rows: list[dict]) -> tuple[int, int]:
         "parsed_count": len(rows),
         "saved_count": n,
         "skipped_count": len(matched),
+        "file_storage_path": file_path,
     })
     save_upload_matches([
         {
@@ -240,6 +258,10 @@ def save_rows(rows: list[dict]) -> tuple[int, int]:
 
     return n, len(matched)
 
+
+if storage_cfg() and not st.session_state.get("_bucket_ensured"):
+    file_storage.ensure_bucket(storage_cfg()["url"], storage_cfg()["service_role_key"])
+    st.session_state["_bucket_ensured"] = True
 
 st.title("Office Expenses, Bank & Trading Tracker")
 st.caption("Data is stored in your private Supabase project — accessible only with the app password.")
@@ -264,14 +286,15 @@ with tab_upload:
     if sms_files and st.button("Parse & save SMS"):
         total, total_skipped = 0, 0
         for f in sms_files:
+            raw_bytes = f.getvalue()
             try:
-                rows = sms_parser.parse_sms_file(f.name, f.read())
+                rows = sms_parser.parse_sms_file(f.name, raw_bytes)
             except ValueError as e:
                 st.error(str(e))
                 continue
             for r in rows:
                 r["source_file"] = f.name
-            n, skipped = save_rows(rows)
+            n, skipped = save_rows(rows, raw_file=(f.name, raw_bytes, f.type or "text/plain"))
             total += n
             total_skipped += skipped
         msg = f"Saved {total} new SMS transactions."
@@ -337,7 +360,7 @@ with tab_upload:
                 rows = statement_parser.normalize_table(df, mapping, bank or "Unknown Bank",
                                                          account or "Unknown", f.name,
                                                          default_direction=default_dir)
-                n, skipped = save_rows(rows)
+                n, skipped = save_rows(rows, raw_file=(f.name, raw_bytes, "application/pdf"))
                 msg = f"Saved {n} new transactions from {f.name} (of {len(rows)} parsed)."
                 if skipped:
                     msg += f" {skipped} already matched an existing transaction (e.g. an SMS you tagged) and were not duplicated."
@@ -380,7 +403,7 @@ with tab_upload:
                     "price": price_col, "net_amount": net_col,
                 }.items() if v != "-- none --"}
                 rows = contract_note_parser.normalize_trades(df, mapping, meta, broker or "Unknown Broker", f.name)
-                n, skipped = save_rows(rows)
+                n, skipped = save_rows(rows, raw_file=(f.name, raw_bytes, "application/pdf"))
                 msg = f"Saved {n} new trade rows from {f.name} (of {len(rows)} parsed)."
                 if skipped:
                     msg += f" {skipped} already matched an existing trade row and were not duplicated."
@@ -464,12 +487,29 @@ with tab_uploads_log:
                 else:
                     st.caption("Nothing was skipped — every parsed row was new.")
 
+                scfg = storage_cfg()
+                if b.get("file_storage_path"):
+                    if scfg:
+                        url = file_storage.signed_url(scfg["url"], scfg["service_role_key"], b["file_storage_path"])
+                        if url:
+                            st.link_button("📄 Download original file", url)
+                        else:
+                            st.caption("Original file is saved, but couldn't generate a download link right now.")
+                    else:
+                        st.caption("Original file is saved, but Storage isn't configured to fetch it right now.")
+                elif scfg:
+                    st.caption("No original file kept for this upload (e.g. a cash entry, or uploaded before "
+                               "file storage was added).")
+
                 confirm_key = f"confirm_del_{b['id']}"
-                confirm = st.checkbox(f"Yes, delete the {b['saved_count']} transaction(s) this batch saved",
+                confirm = st.checkbox(f"Yes, delete the {b['saved_count']} transaction(s) this batch saved"
+                                       + (" and its stored file" if b.get("file_storage_path") else ""),
                                        key=confirm_key)
                 if st.button("Delete this batch", key=f"del_{b['id']}", disabled=not confirm):
+                    if b.get("file_storage_path") and scfg:
+                        file_storage.delete_file(scfg["url"], scfg["service_role_key"], b["file_storage_path"])
                     delete_upload_batch(b["id"], b["source_file"])
-                    st.success("Batch and its transactions deleted.")
+                    st.success("Batch, its transactions, and its stored file (if any) were deleted.")
                     st.rerun()
 
 # --------------------------------------------------------- Review tab -----

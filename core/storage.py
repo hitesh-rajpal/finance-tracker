@@ -124,8 +124,10 @@ CREATE TABLE IF NOT EXISTS upload_batches (
     source_type TEXT,                 -- 'sms' | 'statement' | 'contract_note'
     parsed_count INTEGER,
     saved_count INTEGER,
-    skipped_count INTEGER
+    skipped_count INTEGER,
+    file_storage_path TEXT            -- path in Supabase Storage of the original uploaded file, if kept
 );
+ALTER TABLE upload_batches ADD COLUMN IF NOT EXISTS file_storage_path TEXT;
 
 -- Rows from an upload that were SKIPPED because they matched something
 -- already recorded — kept so you can see exactly which incoming message/line
@@ -240,11 +242,14 @@ def update_transaction(txn_id: str, category: str, is_office: bool, parties: lis
 
 
 def save_upload_batch(batch: dict):
+    batch.setdefault("file_storage_path", None)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO upload_batches (id, source_file, source_type, parsed_count, saved_count, skipped_count)
-                   VALUES (%(id)s, %(source_file)s, %(source_type)s, %(parsed_count)s, %(saved_count)s, %(skipped_count)s)""",
+                """INSERT INTO upload_batches
+                   (id, source_file, source_type, parsed_count, saved_count, skipped_count, file_storage_path)
+                   VALUES (%(id)s, %(source_file)s, %(source_type)s, %(parsed_count)s, %(saved_count)s,
+                    %(skipped_count)s, %(file_storage_path)s)""",
                 batch,
             )
 
