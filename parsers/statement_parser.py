@@ -72,6 +72,54 @@ class PasswordRequired(Exception):
     trying a password, so the UI offers one either way."""
 
 
+_DATE_CELL_RE = re.compile(
+    r"^\d{1,2}[\s/-][A-Za-z]{3,9}[\s/-]?\d{2,4}$"   # 24 Jul 26 / 24-Jul-2026 / 24/Jul/26
+    r"|^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$"              # 24/07/2026 / 24-07-26
+    r"|^\d{4}-\d{2}-\d{2}$"                          # 2026-07-24
+)
+
+
+def _cell_looks_like_date(text) -> bool:
+    """Deliberately a strict pattern match, not dateutil.parser — dateutil
+    happily treats a bare number like '499' or '9,999' as a year (defaulting
+    the rest to today), which made this check pass for a fee-schedule table
+    full of plain rupee amounts. Requires actual day+month+year structure."""
+    text = (text or "").strip()
+    if not text or len(text) > 20:
+        return False
+    return bool(_DATE_CELL_RE.match(text))
+
+
+def _table_has_date_column(table) -> bool:
+    """Whether any cell in this table looks like a date — used to skip
+    boilerplate tables (fee schedules, T&C tables) that extract_tables()
+    picks up alongside the real transaction table but that would otherwise
+    corrupt it once everything gets concatenated together."""
+    return any(_cell_looks_like_date(cell) for row in table for cell in row)
+
+
+# Some statements (seen on a real SBI card statement) lay out transactions
+# as plain text lines with no visible table grid at all, so extract_tables()
+# finds nothing there — e.g. "24 Jul 26 Avenue Supermarts Ltd IN 308.00 D".
+# This mirrors sms_parser's line-based approach for the same reason: no
+# gridlines for pdfplumber's table detector to key off of.
+_TEXT_LINE_TXN_RE = re.compile(r"^(\d{1,2}\s+[A-Za-z]{3}\s+\d{2,4})\s+(.+?)\s+([\d,]+\.\d{2})\s*([DC])$")
+
+
+def _extract_text_line_rows(pdf) -> list[list[str]]:
+    rows = []
+    for page in pdf.pages:
+        text = page.extract_text() or ""
+        for line in text.split("\n"):
+            m = _TEXT_LINE_TXN_RE.match(line.strip())
+            if not m:
+                continue
+            txn_date, desc, amount, marker = m.groups()
+            marker_word = "Cr" if marker == "C" else "Dr"
+            rows.append([txn_date, desc.strip(), f"{amount} {marker_word}"])
+    return rows
+
+
 def extract_raw_table(pdf_bytes: bytes, password: str | None = None) -> pd.DataFrame:
     """Best-effort extraction of the transaction table across all pages."""
     all_rows = []
@@ -86,6 +134,8 @@ def extract_raw_table(pdf_bytes: bytes, password: str | None = None) -> pd.DataF
             for table in tables:
                 if not table or len(table) < 2:
                     continue
+                if not _table_has_date_column(table):
+                    continue  # boilerplate (fee schedule, T&C, etc.), not the transaction table
                 # find the most header-like row near the top of this table
                 candidate_idx = max(range(min(3, len(table))), key=lambda i: _score_header_row(table[i]))
                 if _score_header_row(table[candidate_idx]) >= 2:
@@ -97,6 +147,11 @@ def extract_raw_table(pdf_bytes: bytes, password: str | None = None) -> pd.DataF
                 for row in body:
                     if row and any((c or "").strip() for c in row):
                         all_rows.append(row)
+
+        if not all_rows:
+            text_rows = _extract_text_line_rows(pdf)
+            if text_rows:
+                return pd.DataFrame(text_rows, columns=["Date", "Description", "Amount"])
 
     if not all_rows:
         return pd.DataFrame()
