@@ -73,10 +73,14 @@ def require_login():
     controller = CookieController() if CookieController else None
 
     # Try a silent re-login from a remembered refresh token before showing
-    # the form at all. The cookie component reports its value asynchronously,
-    # so this may only succeed a rerun or two after the page first loads —
-    # that's fine, it just means a brief flash of the login form once.
-    if controller is not None and not st.session_state.get("_remember_tried"):
+    # the form at all. The cookie component reports its value asynchronously
+    # (None on the very first script run, since the component's JS hasn't
+    # loaded yet) — its real value arriving is itself what triggers the next
+    # Streamlit rerun, so this check must run on EVERY rerun until we're
+    # authenticated, not just once. A one-shot check (this function's first
+    # version) gives up permanently before the cookie ever has a chance to
+    # load, which is exactly the "remember me doesn't work" bug this fixes.
+    if controller is not None:
         remembered = controller.get(REMEMBER_COOKIE)
         if remembered:
             ok, result = auth.refresh_session(auth_cfg["url"], auth_cfg["anon_key"], remembered)
@@ -87,7 +91,6 @@ def require_login():
                 if new_refresh:
                     controller.set(REMEMBER_COOKIE, new_refresh, max_age=REMEMBER_MAX_AGE)
                 st.rerun()
-        st.session_state["_remember_tried"] = True
 
     def on_submit():
         email = st.session_state.get("login_email", "").strip()
@@ -130,7 +133,7 @@ def render_logout():
         if st.button("Log out"):
             if auth_cfg and CookieController:
                 CookieController().remove(REMEMBER_COOKIE)
-            for k in ("authenticated", "user_email", "_remember_tried"):
+            for k in ("authenticated", "user_email"):
                 st.session_state.pop(k, None)
             st.rerun()
 
