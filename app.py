@@ -18,18 +18,16 @@ from core.storage import (
 from core.categorize import categorize, apply_correction, is_office_for_category
 from core import reports
 from core import financial_rules as fr
+from core import auth
 from parsers import sms_parser, statement_parser, contract_note_parser
 
 st.set_page_config(page_title="Finance Tracker", layout="wide")
 
 
-def require_password():
-    """Gate the whole app behind a single shared password (st.secrets['APP_PASSWORD']).
-    This app is deployed to a public URL and holds bank/trading data, so nothing
-    below this check should render for an unauthenticated visitor."""
-    if st.session_state.get("authenticated"):
-        return
-
+def _legacy_password_gate():
+    """Old single-shared-password check — kept only as a fallback for while
+    [supabase_auth] isn't configured yet in secrets, so the deployed app
+    doesn't break mid-migration to real login."""
     def on_submit():
         entered = st.session_state.get("password_input", "")
         expected = st.secrets.get("APP_PASSWORD", "")
@@ -38,14 +36,55 @@ def require_password():
         else:
             st.session_state["auth_failed"] = True
 
-    st.title("🔒 Finance Tracker")
+    st.caption("(Temporary fallback login — real email/password login isn't configured yet.)")
     st.text_input("Password", type="password", key="password_input", on_change=on_submit)
     if st.session_state.get("auth_failed"):
         st.error("Incorrect password.")
+
+
+def require_login():
+    """Gates the whole app behind real Supabase Auth email/password login
+    (with a working forgot-password flow) once [supabase_auth] is set in
+    secrets; falls back to the old shared-password check until then. This
+    app is deployed to a public URL and holds bank/trading data, so nothing
+    below this check should render for an unauthenticated visitor."""
+    if st.session_state.get("authenticated"):
+        return
+
+    st.title("🔒 Finance Tracker")
+    auth_cfg = st.secrets.get("supabase_auth")
+
+    if not auth_cfg:
+        _legacy_password_gate()
+        st.stop()
+
+    def on_submit():
+        email = st.session_state.get("login_email", "").strip()
+        password = st.session_state.get("login_password", "")
+        ok, msg = auth.sign_in(auth_cfg["url"], auth_cfg["anon_key"], email, password)
+        if ok:
+            st.session_state["authenticated"] = True
+            st.session_state["user_email"] = email
+        else:
+            st.session_state["auth_failed"] = msg
+
+    st.text_input("Email", key="login_email")
+    st.text_input("Password", type="password", key="login_password", on_change=on_submit)
+    if st.button("Log in"):
+        on_submit()
+    if st.session_state.get("auth_failed"):
+        st.error(st.session_state["auth_failed"])
+
+    with st.expander("Forgot password?"):
+        reset_email = st.text_input("Your email", key="reset_email")
+        if st.button("Send reset link"):
+            auth.send_password_reset(auth_cfg["url"], auth_cfg["anon_key"], reset_email.strip())
+            st.success("If that email has an account, a reset link has been sent to it.")
+
     st.stop()
 
 
-require_password()
+require_login()
 init_db()
 ensure_party("Office")
 
@@ -346,13 +385,16 @@ with tab_uploads_log:
                 f"skipped {b['skipped_count']}"
             )
             with st.expander(title):
-                st.markdown(f"**✅ Saved (new) — {b['saved_count']}:**")
-                if b["saved_count"]:
-                    saved_rows = get_batch_transactions(b["id"])
+                saved_rows = get_batch_transactions(b["id"]) if b["saved_count"] else []
+                st.markdown(f"**✅ Saved (new) — {len(saved_rows)}:**")
+                if saved_rows:
                     st.dataframe(
                         pd.DataFrame(saved_rows)[["date", "amount", "direction", "category", "description"]],
                         use_container_width=True, hide_index=True,
                     )
+                elif b["saved_count"]:
+                    st.caption(f"{b['saved_count']} row(s) were saved here originally but have since been "
+                               "deleted or edited elsewhere.")
                 else:
                     st.caption("Nothing new — every parsed row already existed.")
 
