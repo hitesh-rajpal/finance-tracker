@@ -12,7 +12,7 @@ from core.storage import (
     ensure_account, get_account_master, update_account, update_transaction,
     save_rule, get_rules, delete_rule, ensure_party, get_party_master,
     save_upload_batch, get_upload_batches, save_upload_matches, get_upload_matches,
-    delete_upload_batch,
+    delete_upload_batch, get_batch_transactions,
 )
 from core.categorize import categorize, apply_correction, is_office_for_category
 from core import reports
@@ -184,6 +184,7 @@ with tab_upload:
         msg = f"Saved {total} new SMS transactions."
         if total_skipped:
             msg += f" Skipped {total_skipped} that matched an already-recorded transaction."
+        msg += " See the 📁 Uploads tab for the itemized list of exactly what was saved vs skipped, and why."
         st.success(msg)
 
     st.divider()
@@ -247,6 +248,7 @@ with tab_upload:
                 msg = f"Saved {n} new transactions from {f.name} (of {len(rows)} parsed)."
                 if skipped:
                     msg += f" {skipped} already matched an existing transaction (e.g. an SMS you tagged) and were not duplicated."
+                msg += " See the 📁 Uploads tab for the itemized list."
                 st.success(msg)
 
     st.divider()
@@ -289,14 +291,15 @@ with tab_upload:
                 msg = f"Saved {n} new trade rows from {f.name} (of {len(rows)} parsed)."
                 if skipped:
                     msg += f" {skipped} already matched an existing trade row and were not duplicated."
+                msg += " See the 📁 Uploads tab for the itemized list."
                 st.success(msg)
 
 # --------------------------------------------------------- Uploads tab ----
 with tab_uploads_log:
     st.caption(
         "Every 'Parse & save' / 'Add transactions' click, with what happened. Expand a batch to see "
-        "exactly which incoming SMS/statement line matched which already-recorded transaction (and why) "
-        "— those are the ones that got skipped instead of duplicated. Delete a batch to remove every "
+        "exactly which rows were newly saved and which were skipped because they matched something "
+        "already recorded (and which existing transaction, and why). Delete a batch to remove every "
         "transaction it saved."
     )
     batches = get_upload_batches()
@@ -310,9 +313,19 @@ with tab_uploads_log:
                 f"skipped {b['skipped_count']}"
             )
             with st.expander(title):
+                st.markdown(f"**✅ Saved (new) — {b['saved_count']}:**")
+                if b["saved_count"]:
+                    saved_rows = get_batch_transactions(b["id"])
+                    st.dataframe(
+                        pd.DataFrame(saved_rows)[["date", "amount", "direction", "category", "description"]],
+                        use_container_width=True, hide_index=True,
+                    )
+                else:
+                    st.caption("Nothing new — every parsed row already existed.")
+
+                st.markdown(f"**⏭️ Skipped (already recorded) — {b['skipped_count']}:**")
                 if b["skipped_count"]:
                     matches = get_upload_matches(b["id"])
-                    st.markdown("**Matched (skipped as already recorded):**")
                     for m in matches:
                         reason = "same reference number" if m["match_reason"] == "reference_number" else "same amount/date"
                         st.markdown(

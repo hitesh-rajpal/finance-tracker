@@ -211,6 +211,13 @@ def fetch_all() -> list[dict]:
             return cur.fetchall()
 
 
+def get_batch_transactions(batch_id: str) -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM transactions WHERE upload_batch_id = %s ORDER BY date", (batch_id,))
+            return cur.fetchall()
+
+
 def update_transaction(txn_id: str, category: str, is_office: bool, parties: list[str] | None = None):
     with get_conn() as conn:
         with conn.cursor() as cur:
