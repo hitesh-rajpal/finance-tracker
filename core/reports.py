@@ -47,7 +47,13 @@ def to_dataframe(rows) -> pd.DataFrame:
     if df.empty:
         return df
     df["date"] = pd.to_datetime(df["date"])
-    df["is_office"] = df["is_office"].astype(bool)
+    df["parties"] = df["parties"].apply(lambda p: list(p) if p else [])
+    # parties is the source of truth for is_office going forward: any row
+    # whose parties list includes 'Office' (case-insensitive) counts as an
+    # office expense, regardless of what's separately stored in is_office —
+    # this keeps every existing report (which just reads df["is_office"])
+    # correct without needing to touch them one by one.
+    df["is_office"] = df["parties"].apply(lambda ps: any(p.strip().lower() == "office" for p in ps))
     df["month"] = df["date"].dt.to_period("M").astype(str)
     return df
 
@@ -134,6 +140,26 @@ def personal_vs_office(df: pd.DataFrame) -> pd.DataFrame:
     subset = subset.copy()
     subset["tag"] = subset["is_office"].map({True: "Office", False: "Personal"})
     return subset.groupby("tag")["amount"].sum().reset_index()
+
+
+def party_breakdown(df: pd.DataFrame) -> pd.DataFrame:
+    """Spend grouped by who it's linked to — a transaction with multiple
+    parties (e.g. a bill split 'Ram, Sham') counts its full amount toward
+    each party, not divided, since this tracks involvement, not a settlement."""
+    if df.empty:
+        return df
+    subset = df[(df["direction"] == "debit") & (df["source"] != "contract_note")]
+    exploded = subset.explode("parties")
+    exploded = exploded[exploded["parties"].notna() & (exploded["parties"] != "")]
+    if exploded.empty:
+        return pd.DataFrame()
+    return (
+        exploded.groupby("parties")["amount"]
+        .agg(total="sum", count="count")
+        .reset_index()
+        .rename(columns={"parties": "party"})
+        .sort_values("total", ascending=False)
+    )
 
 
 def trading_summary(df: pd.DataFrame) -> pd.DataFrame:

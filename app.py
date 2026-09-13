@@ -9,7 +9,7 @@ import streamlit as st
 from core.storage import (
     init_db, upsert_transactions, fetch_all, make_txn_id, delete_transactions, delete_all,
     ensure_account, get_account_master, update_account, update_transaction,
-    save_rule, get_rules, delete_rule,
+    save_rule, get_rules, delete_rule, ensure_party, get_party_master,
 )
 from core.categorize import categorize, apply_correction, is_office_for_category
 from core import reports
@@ -43,6 +43,7 @@ def require_password():
 
 require_password()
 init_db()
+ensure_party("Office")
 
 
 def load_df() -> pd.DataFrame:
@@ -88,6 +89,10 @@ def save_rows(rows: list[dict]) -> tuple[int, int]:
         elif not has_is_office:
             r["is_office"] = is_office_for_category(r["category"])
         r["is_office"] = bool(r.get("is_office"))
+        if not r.get("parties"):
+            r["parties"] = ["Office"] if r["is_office"] else []
+        for p in r["parties"]:
+            ensure_party(p)
         for k in ("account", "bank", "source_file", "scrip"):
             r.setdefault(k, None)
         for k in ("quantity", "price", "charges"):
@@ -252,12 +257,19 @@ with tab_review:
     if df.empty:
         st.info("No transactions yet — upload some data first.")
     else:
-        st.caption("Edit Category / Is Office and hit Save — corrections are remembered for similar "
-                   "merchants going forward. Delete a row with the trash icon on its left, then Save.")
+        known_parties = get_party_master()
+        st.caption(
+            "Edit Category / Parties and hit Save — corrections are remembered for similar merchants "
+            "going forward. Parties is who this relates to — 'Office' drives the office-expense reports, "
+            "but you can add any name (comma-separated for more than one, e.g. 'Ram, Sham'). "
+            f"Known so far: {', '.join(known_parties) if known_parties else '(none yet)'}. "
+            "Delete a row with the trash icon on its left, then Save."
+        )
         show_uncat_only = st.checkbox("Show only Uncategorized", value=True)
         view = df[df["category"] == "Uncategorized"] if show_uncat_only else df
         editable = view[["id", "date", "amount", "direction", "account", "bank",
-                          "description", "category", "is_office"]].copy()
+                          "description", "category", "parties"]].copy()
+        editable["parties"] = editable["parties"].apply(lambda ps: ", ".join(ps))
         edited = st.data_editor(
             editable, use_container_width=True, hide_index=True, key="editor",
             disabled=["id", "date", "amount", "direction", "account", "bank", "description"],
@@ -268,8 +280,13 @@ with tab_review:
             delete_transactions(list(removed_ids))
             changed = 0
             for _, row in edited.iterrows():
-                update_transaction(row["id"], row["category"], bool(row["is_office"]))
-                apply_correction(row["description"], row["category"], bool(row["is_office"]))
+                raw_parties = "" if pd.isna(row["parties"]) else str(row["parties"])
+                parties = [p.strip() for p in raw_parties.split(",") if p.strip()]
+                is_office = any(p.lower() == "office" for p in parties)
+                for p in parties:
+                    ensure_party(p)
+                update_transaction(row["id"], row["category"], is_office, parties)
+                apply_correction(row["description"], row["category"], is_office)
                 changed += 1
             msg = f"Updated {changed} rows."
             if removed_ids:
@@ -370,6 +387,14 @@ with tab_reports:
             if not pvo.empty:
                 st.plotly_chart(px.pie(pvo, names="tag", values="amount"), use_container_width=True)
                 st.dataframe(pvo, use_container_width=True)
+
+        st.markdown("### By party (who it's linked to)")
+        party = reports.party_breakdown(f)
+        if party.empty:
+            st.caption("No transactions tagged to a party yet — add names in the Review & Categorize tab.")
+        else:
+            st.plotly_chart(px.bar(party, x="party", y="total"), use_container_width=True)
+            st.dataframe(party, use_container_width=True)
 
         st.markdown("### Income analysis")
         inc = reports.income_analysis(f)
