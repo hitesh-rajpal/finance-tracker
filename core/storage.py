@@ -74,17 +74,22 @@ CREATE TABLE IF NOT EXISTS party_master (
     name TEXT PRIMARY KEY
 );
 
--- Passwords for password-protected statement PDFs (common for Indian bank/
--- credit-card statements), keyed by a label you choose (e.g. "BPCL SBI
--- Card") so next month's statement from the same source can reuse it
--- instead of asking again. Stored in plaintext — this is inherent to the
--- feature (the app needs to hand the literal password to the PDF reader
--- each time) and no different in kind from the DB/API credentials already
--- held in this same database; it's only ever read back by this app.
+-- A recurring statement source (e.g. "BPCL SBI Card"), keyed by a label you
+-- choose, remembering whatever's needed to process next month's statement
+-- from the same source without re-entering it: the PDF password if any
+-- (plaintext — inherent to the feature, the app has to hand the literal
+-- password to the PDF reader each time, no different in kind from the DB/
+-- API credentials already held in this same database), and the bank name /
+-- account label to pre-fill instead of typing them again.
 CREATE TABLE IF NOT EXISTS pdf_password_master (
     label TEXT PRIMARY KEY,
-    password TEXT NOT NULL
+    password TEXT,
+    bank TEXT,
+    account TEXT
 );
+ALTER TABLE pdf_password_master ALTER COLUMN password DROP NOT NULL;
+ALTER TABLE pdf_password_master ADD COLUMN IF NOT EXISTS bank TEXT;
+ALTER TABLE pdf_password_master ADD COLUMN IF NOT EXISTS account TEXT;
 
 -- Things you EXPECT to happen (savings interest at a rate, credit-card
 -- cashback at a rate, a home/personal loan EMI on its amortization
@@ -355,13 +360,22 @@ def rename_party(old_name: str, new_name: str):
             cur.execute("INSERT INTO party_master (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (new_name,))
 
 
-def save_pdf_password(label: str, password: str):
+def save_statement_profile(label: str, password: str | None = None, bank: str | None = None,
+                            account: str | None = None):
+    """Upserts a statement-source profile by label. Any field left as None
+    (e.g. saving just the password before the bank/account fields are even
+    shown, or saving bank/account for a source that needs no password) keeps
+    whatever was already stored for that field, rather than wiping it out."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO pdf_password_master (label, password) VALUES (%s, %s)
-                   ON CONFLICT (label) DO UPDATE SET password = EXCLUDED.password""",
-                (label, password),
+                """INSERT INTO pdf_password_master (label, password, bank, account)
+                   VALUES (%(label)s, %(password)s, %(bank)s, %(account)s)
+                   ON CONFLICT (label) DO UPDATE SET
+                     password = COALESCE(EXCLUDED.password, pdf_password_master.password),
+                     bank = COALESCE(EXCLUDED.bank, pdf_password_master.bank),
+                     account = COALESCE(EXCLUDED.account, pdf_password_master.account)""",
+                {"label": label, "password": password, "bank": bank, "account": account},
             )
 
 

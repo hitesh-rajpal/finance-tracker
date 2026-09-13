@@ -14,7 +14,7 @@ from core.storage import (
     save_rate_change, get_rate_changes, delete_rate_change,
     save_upload_batch, get_upload_batches, save_upload_matches, get_upload_matches,
     delete_upload_batch, get_batch_transactions,
-    save_pdf_password, get_pdf_passwords, delete_pdf_password,
+    save_statement_profile, get_pdf_passwords, delete_pdf_password,
 )
 from core.categorize import categorize, apply_correction, is_office_for_category
 from core import reports
@@ -290,6 +290,7 @@ def handle_password_protected_pdf(f, extract_fn, saved_passwords):
         result, err = _try(match["password"])
         if not err:
             st.session_state[pw_state_key] = match["password"]
+            st.session_state[f"profile_label_{f.name}"] = choice
             st.rerun()
         else:
             st.error("That saved password didn't work for this file.")
@@ -300,7 +301,8 @@ def handle_password_protected_pdf(f, extract_fn, saved_passwords):
         "Save this password for future statements as",
         value=f.name.rsplit(".", 1)[0], key=f"pwlabel_{f.name}",
         help="Next month's statement from this same source — pick this label from the dropdown "
-             "instead of retyping the password.",
+             "instead of retyping the password. The bank/account you enter next will be remembered "
+             "under this same label too.",
     )
     if st.button("Try this password", key=f"pwtry_{f.name}") and typed_pw:
         result, err = _try(typed_pw)
@@ -309,7 +311,8 @@ def handle_password_protected_pdf(f, extract_fn, saved_passwords):
         else:
             st.session_state[pw_state_key] = typed_pw
             save_label = label_input.strip() or f.name.rsplit(".", 1)[0]
-            save_pdf_password(save_label, typed_pw)
+            save_statement_profile(save_label, password=typed_pw)
+            st.session_state[f"profile_label_{f.name}"] = save_label
             st.success(f"Password worked — saved as '{save_label}' for next time.")
             st.rerun()
     return None
@@ -388,10 +391,41 @@ with tab_upload:
                 val = mapping_guess.get(field)
                 return cols.index(val) if val in cols else 0
 
+            active_label = st.session_state.get(f"profile_label_{f.name}")
+            profile_options = ["-- none --"] + [p["label"] for p in saved_passwords]
+
+            if active_label and f"bank_{f.name}" not in st.session_state:
+                match = next((p for p in saved_passwords if p["label"] == active_label), None)
+                if match and (match.get("bank") or match.get("account")):
+                    st.session_state[f"bank_{f.name}"] = match.get("bank") or ""
+                    st.session_state[f"acct_{f.name}"] = match.get("account") or ""
+
+            def _apply_profile(_fname=f.name, _profiles=saved_passwords):
+                chosen = st.session_state.get(f"profilechoice_{_fname}")
+                if chosen and chosen != "-- none --":
+                    match = next((p for p in _profiles if p["label"] == chosen), None)
+                    if match:
+                        st.session_state[f"bank_{_fname}"] = match.get("bank") or ""
+                        st.session_state[f"acct_{_fname}"] = match.get("account") or ""
+
+            default_idx = profile_options.index(active_label) if active_label in profile_options else 0
+            st.selectbox(
+                "Use a saved statement source (auto-fills bank/account below)",
+                profile_options, index=default_idx, key=f"profilechoice_{f.name}", on_change=_apply_profile,
+                help="Auto-selected once a saved password matched. Pick a different one, or leave as-is "
+                     "and just save under a new label below once you type the bank/account.",
+            )
+
             c1, c2 = st.columns(2)
             bank = c1.text_input("Bank name", key=f"bank_{f.name}",
                                   help="Use the same spelling as any existing account (Accounts tab) so they merge into one.")
             account = c2.text_input("Account/card label (e.g. XX1234)", key=f"acct_{f.name}")
+            save_profile_label = st.text_input(
+                "Remember this bank/account for next time as",
+                value=active_label or f.name.rsplit(".", 1)[0], key=f"profilelabel_{f.name}",
+                help="Next month's statement — pick this label from the dropdown above instead of "
+                     "retyping the bank/account.",
+            )
             c1, c2, c3, c4 = st.columns(4)
             date_col = c1.selectbox("Date column", cols, index=idx("date"), key=f"date_{f.name}")
             desc_col = c2.selectbox("Description column", cols, index=idx("description"), key=f"desc_{f.name}")
@@ -413,6 +447,8 @@ with tab_upload:
             )
 
             if st.button(f"Add transactions from {f.name}", key=f"commit_{f.name}"):
+                if bank.strip() and account.strip() and save_profile_label.strip():
+                    save_statement_profile(save_profile_label.strip(), bank=bank.strip(), account=account.strip())
                 mapping = {"date": date_col, "description": desc_col}
                 if debit_col != "-- none --":
                     mapping["debit"] = debit_col
