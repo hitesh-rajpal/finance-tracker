@@ -40,10 +40,14 @@ CREATE TABLE IF NOT EXISTS transactions (
     price DOUBLE PRECISION,
     charges DOUBLE PRECISION,
     account_key TEXT,                 -- normalized join key into account_master
-    parties TEXT[]                    -- who this relates to: 'Office', 'Brother', 'Ram', 'Sham', ... (0, 1, or many)
+    parties TEXT[],                   -- who this relates to: 'Office', 'Brother', 'Ram', 'Sham', ... (0, 1, or many)
+    edit_source TEXT,                 -- how category/parties were set: 'sms_tag' | 'bank_category' | 'auto' | 'manual'
+    upload_batch_id TEXT              -- which upload this row came from (upload_batches.id)
 );
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS account_key TEXT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS parties TEXT[];
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS edit_source TEXT;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS upload_batch_id TEXT;
 
 CREATE TABLE IF NOT EXISTS category_overrides (
     description_key TEXT PRIMARY KEY,  -- normalized merchant/description snippet
@@ -98,6 +102,32 @@ CREATE TABLE IF NOT EXISTS financial_rules (
     due_day INTEGER,
     active BOOLEAN DEFAULT TRUE
 );
+
+-- One row per "Parse & save" / "Add transactions" click, so you can see
+-- exactly what you uploaded and when, and delete a whole upload's worth of
+-- transactions in one go.
+CREATE TABLE IF NOT EXISTS upload_batches (
+    id TEXT PRIMARY KEY,
+    uploaded_at TIMESTAMP DEFAULT now(),
+    source_file TEXT,
+    source_type TEXT,                 -- 'sms' | 'statement' | 'contract_note'
+    parsed_count INTEGER,
+    saved_count INTEGER,
+    skipped_count INTEGER
+);
+
+-- Rows from an upload that were SKIPPED because they matched something
+-- already recorded — kept so you can see exactly which incoming message/line
+-- matched which existing transaction, and why (reference number vs amount+date).
+CREATE TABLE IF NOT EXISTS upload_matches (
+    id TEXT PRIMARY KEY,
+    batch_id TEXT,
+    new_raw_text TEXT,
+    new_amount DOUBLE PRECISION,
+    new_date DATE,
+    matched_transaction_id TEXT,
+    match_reason TEXT                 -- 'reference_number' | 'amount_date'
+);
 """
 
 
@@ -147,15 +177,18 @@ def upsert_transactions(rows: list[dict]) -> int:
             for r in rows:
                 r.setdefault("account_key", None)
                 r.setdefault("parties", None)
+                r.setdefault("edit_source", None)
+                r.setdefault("upload_batch_id", None)
                 cur.execute(
                     """INSERT INTO transactions
                        (id, date, amount, direction, account, bank, description,
                         category, is_office, source, source_file, raw_text,
-                        scrip, quantity, price, charges, account_key, parties)
+                        scrip, quantity, price, charges, account_key, parties,
+                        edit_source, upload_batch_id)
                        VALUES (%(id)s, %(date)s, %(amount)s, %(direction)s, %(account)s,
                         %(bank)s, %(description)s, %(category)s, %(is_office)s, %(source)s,
                         %(source_file)s, %(raw_text)s, %(scrip)s, %(quantity)s, %(price)s,
-                        %(charges)s, %(account_key)s, %(parties)s)
+                        %(charges)s, %(account_key)s, %(parties)s, %(edit_source)s, %(upload_batch_id)s)
                        ON CONFLICT (id) DO NOTHING""",
                     r,
                 )
@@ -182,9 +215,71 @@ def update_transaction(txn_id: str, category: str, is_office: bool, parties: lis
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE transactions SET category = %s, is_office = %s, parties = %s WHERE id = %s",
+                "UPDATE transactions SET category = %s, is_office = %s, parties = %s, edit_source = 'manual' "
+                "WHERE id = %s",
                 (category, is_office, parties, txn_id),
             )
+
+
+def save_upload_batch(batch: dict):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO upload_batches (id, source_file, source_type, parsed_count, saved_count, skipped_count)
+                   VALUES (%(id)s, %(source_file)s, %(source_type)s, %(parsed_count)s, %(saved_count)s, %(skipped_count)s)""",
+                batch,
+            )
+
+
+def get_upload_batches() -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM upload_batches ORDER BY uploaded_at DESC")
+            return cur.fetchall()
+
+
+def save_upload_matches(matches: list[dict]):
+    if not matches:
+        return
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for m in matches:
+                cur.execute(
+                    """INSERT INTO upload_matches
+                       (id, batch_id, new_raw_text, new_amount, new_date, matched_transaction_id, match_reason)
+                       VALUES (%(id)s, %(batch_id)s, %(new_raw_text)s, %(new_amount)s, %(new_date)s,
+                        %(matched_transaction_id)s, %(match_reason)s)""",
+                    m,
+                )
+
+
+def get_upload_matches(batch_id: str) -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT m.*, t.description AS matched_description, t.date AS matched_date,
+                          t.amount AS matched_amount, t.source AS matched_source,
+                          t.source_file AS matched_source_file
+                   FROM upload_matches m
+                   LEFT JOIN transactions t ON t.id = m.matched_transaction_id
+                   WHERE m.batch_id = %s""",
+                (batch_id,),
+            )
+            return cur.fetchall()
+
+
+def delete_upload_batch(batch_id: str, source_file: str):
+    """Deletes the batch record, its match log, and every transaction that
+    came from that upload (matched by upload_batch_id — falls back to
+    source_file for pre-existing rows saved before batch tracking existed)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM transactions WHERE upload_batch_id = %s OR (upload_batch_id IS NULL AND source_file = %s)",
+                (batch_id, source_file),
+            )
+            cur.execute("DELETE FROM upload_matches WHERE batch_id = %s", (batch_id,))
+            cur.execute("DELETE FROM upload_batches WHERE id = %s", (batch_id,))
 
 
 def ensure_party(name: str):

@@ -13,12 +13,17 @@ def _extract_refs(text: str) -> set:
 
 
 def find_new_transactions(existing_df: pd.DataFrame, new_rows: list[dict], tolerance_days: int = 2):
-    """Splits freshly-parsed rows (not yet saved) into (already_recorded, genuinely_new)
-    by matching against every existing transaction — first by a shared long reference
-    number (UPI ref / txn id) found in both descriptions, then by amount+direction+date
-    within tolerance_days. This is what stops the same real transaction from being
-    double-counted when it arrives via both an SMS tag and a later full statement/contract-
-    note upload, regardless of which one you upload first."""
+    """Splits freshly-parsed rows (not yet saved) into (matched, unmatched) by
+    checking against every existing transaction — first by a shared long
+    reference number (UPI ref / txn id) found in both descriptions, then by
+    amount+direction+date within tolerance_days. This is what stops the same
+    real transaction from being double-counted when it arrives via both an
+    SMS tag and a later full statement/contract-note upload, regardless of
+    which one you upload first.
+
+    `matched` entries are dicts {new, matched_id, reason} — not just the new
+    row — so callers can show *which* existing transaction a skipped upload
+    line corresponds to, instead of only a bare skip count."""
     if existing_df.empty:
         return [], new_rows
     existing_text = existing_df["raw_text"].fillna(existing_df["description"])
@@ -26,17 +31,22 @@ def find_new_transactions(existing_df: pd.DataFrame, new_rows: list[dict], toler
     matched, unmatched = [], []
     for r in new_rows:
         r_refs = _extract_refs(r.get("raw_text") or r.get("description") or "")
-        if r_refs and existing_refs.apply(lambda s: bool(s & r_refs)).any():
-            matched.append(r)
-            continue
-        date = pd.to_datetime(r["date"])
-        window = existing_df[
-            (existing_df["direction"] == r["direction"])
-            & (existing_df["amount"].sub(r["amount"]).abs() < 0.01)
-            & (existing_df["date"].sub(date).abs() <= pd.Timedelta(days=tolerance_days))
-        ]
-        if not window.empty:
-            matched.append(r)
+        match_row, reason = None, None
+        if r_refs:
+            ref_hits = existing_refs.apply(lambda s: bool(s & r_refs))
+            if ref_hits.any():
+                match_row, reason = existing_df[ref_hits].iloc[0], "reference_number"
+        if match_row is None:
+            date = pd.to_datetime(r["date"])
+            window = existing_df[
+                (existing_df["direction"] == r["direction"])
+                & (existing_df["amount"].sub(r["amount"]).abs() < 0.01)
+                & (existing_df["date"].sub(date).abs() <= pd.Timedelta(days=tolerance_days))
+            ]
+            if not window.empty:
+                match_row, reason = window.iloc[0], "amount_date"
+        if match_row is not None:
+            matched.append({"new": r, "matched_id": match_row["id"], "reason": reason})
         else:
             unmatched.append(r)
     return matched, unmatched

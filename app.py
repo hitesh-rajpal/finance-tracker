@@ -1,5 +1,6 @@
 import hmac
 import io
+import uuid
 from datetime import date
 
 import pandas as pd
@@ -10,6 +11,8 @@ from core.storage import (
     init_db, upsert_transactions, fetch_all, make_txn_id, delete_transactions, delete_all,
     ensure_account, get_account_master, update_account, update_transaction,
     save_rule, get_rules, delete_rule, ensure_party, get_party_master,
+    save_upload_batch, get_upload_batches, save_upload_matches, get_upload_matches,
+    delete_upload_batch,
 )
 from core.categorize import categorize, apply_correction, is_office_for_category
 from core import reports
@@ -77,7 +80,13 @@ def account_key_and_label(bank: str | None, account: str | None) -> tuple[str | 
 def save_rows(rows: list[dict]) -> tuple[int, int]:
     """Normalizes rows, skips ones that match an already-recorded transaction
     (by shared reference number, else amount+direction+date), and saves the
-    rest. Returns (saved_count, skipped_as_already_recorded_count)."""
+    rest. Returns (saved_count, skipped_as_already_recorded_count). Also logs
+    an upload_batches row (what/when, with counts) and, for every skipped
+    row, an upload_matches row recording exactly which existing transaction
+    it matched and why — visible in the Uploads tab."""
+    if not rows:
+        return 0, 0
+
     for r in rows:
         has_category = bool(r.get("category"))
         has_is_office = "is_office" in r
@@ -86,8 +95,13 @@ def save_rows(rows: list[dict]) -> tuple[int, int]:
             r["category"] = cat
             if not has_is_office:
                 r["is_office"] = auto_is_office
-        elif not has_is_office:
-            r["is_office"] = is_office_for_category(r["category"])
+            r["edit_source"] = "auto"
+        else:
+            if not has_is_office:
+                r["is_office"] = is_office_for_category(r["category"])
+            r["edit_source"] = "sms_tag" if r.get("source") == "sms" else (
+                "bank_category" if r.get("source") == "statement" else "auto"
+            )
         r["is_office"] = bool(r.get("is_office"))
         if not r.get("parties"):
             r["parties"] = ["Office"] if r["is_office"] else []
@@ -105,15 +119,41 @@ def save_rows(rows: list[dict]) -> tuple[int, int]:
 
     existing_df = load_df()
     matched, unmatched = reports.find_new_transactions(existing_df, rows)
+
+    batch_id = uuid.uuid4().hex[:16]
+    for r in unmatched:
+        r["upload_batch_id"] = batch_id
     n = upsert_transactions(unmatched)
+
+    save_upload_batch({
+        "id": batch_id,
+        "source_file": rows[0].get("source_file"),
+        "source_type": rows[0].get("source"),
+        "parsed_count": len(rows),
+        "saved_count": n,
+        "skipped_count": len(matched),
+    })
+    save_upload_matches([
+        {
+            "id": uuid.uuid4().hex[:16],
+            "batch_id": batch_id,
+            "new_raw_text": m["new"].get("raw_text") or m["new"].get("description"),
+            "new_amount": m["new"]["amount"],
+            "new_date": m["new"]["date"],
+            "matched_transaction_id": m["matched_id"],
+            "match_reason": m["reason"],
+        }
+        for m in matched
+    ])
+
     return n, len(matched)
 
 
 st.title("Office Expenses, Bank & Trading Tracker")
 st.caption("Data is stored in your private Supabase project — accessible only with the app password.")
 
-tab_upload, tab_review, tab_accounts, tab_reports, tab_trading, tab_recon, tab_rules = st.tabs(
-    ["📥 Upload", "🏷️ Review & Categorize", "🏦 Accounts", "📊 Reports", "📈 Trading",
+tab_upload, tab_uploads_log, tab_review, tab_accounts, tab_reports, tab_trading, tab_recon, tab_rules = st.tabs(
+    ["📥 Upload", "📁 Uploads", "🏷️ Review & Categorize", "🏦 Accounts", "📊 Reports", "📈 Trading",
      "🔗 Reconciliation", "🎯 Expected & Cross-Check"]
 )
 
@@ -251,6 +291,49 @@ with tab_upload:
                     msg += f" {skipped} already matched an existing trade row and were not duplicated."
                 st.success(msg)
 
+# --------------------------------------------------------- Uploads tab ----
+with tab_uploads_log:
+    st.caption(
+        "Every 'Parse & save' / 'Add transactions' click, with what happened. Expand a batch to see "
+        "exactly which incoming SMS/statement line matched which already-recorded transaction (and why) "
+        "— those are the ones that got skipped instead of duplicated. Delete a batch to remove every "
+        "transaction it saved."
+    )
+    batches = get_upload_batches()
+    if not batches:
+        st.info("No uploads yet.")
+    else:
+        for b in batches:
+            title = (
+                f"{b['uploaded_at']:%Y-%m-%d %H:%M} — {b['source_file'] or '(unnamed)'} "
+                f"({b['source_type']}) — parsed {b['parsed_count']}, saved {b['saved_count']}, "
+                f"skipped {b['skipped_count']}"
+            )
+            with st.expander(title):
+                if b["skipped_count"]:
+                    matches = get_upload_matches(b["id"])
+                    st.markdown("**Matched (skipped as already recorded):**")
+                    for m in matches:
+                        reason = "same reference number" if m["match_reason"] == "reference_number" else "same amount/date"
+                        st.markdown(
+                            f"- Incoming ({m['new_date']}, ₹{m['new_amount']:,.2f}): "
+                            f"`{(m['new_raw_text'] or '')[:120]}`\n\n"
+                            f"  → matched existing transaction from **{m['matched_source'] or '?'}** "
+                            f"(`{m['matched_source_file'] or '?'}`, {m['matched_date']}, "
+                            f"₹{m['matched_amount']:,.2f}): `{(m['matched_description'] or '')[:120]}` "
+                            f"— matched by {reason}"
+                        )
+                else:
+                    st.caption("Nothing was skipped — every parsed row was new.")
+
+                confirm_key = f"confirm_del_{b['id']}"
+                confirm = st.checkbox(f"Yes, delete the {b['saved_count']} transaction(s) this batch saved",
+                                       key=confirm_key)
+                if st.button("Delete this batch", key=f"del_{b['id']}", disabled=not confirm):
+                    delete_upload_batch(b["id"], b["source_file"])
+                    st.success("Batch and its transactions deleted.")
+                    st.rerun()
+
 # --------------------------------------------------------- Review tab -----
 with tab_review:
     df = load_df()
@@ -268,11 +351,15 @@ with tab_review:
         show_uncat_only = st.checkbox("Show only Uncategorized", value=True)
         view = df[df["category"] == "Uncategorized"] if show_uncat_only else df
         editable = view[["id", "date", "amount", "direction", "account", "bank",
-                          "description", "category", "parties"]].copy()
+                          "description", "category", "parties", "source", "source_file", "edit_source"]].copy()
         editable["parties"] = editable["parties"].apply(lambda ps: ", ".join(ps))
+        editable = editable.rename(columns={
+            "source": "linked from", "source_file": "upload file", "edit_source": "how it was set",
+        })
         edited = st.data_editor(
             editable, use_container_width=True, hide_index=True, key="editor",
-            disabled=["id", "date", "amount", "direction", "account", "bank", "description"],
+            disabled=["id", "date", "amount", "direction", "account", "bank", "description",
+                      "linked from", "upload file", "how it was set"],
             num_rows="dynamic",
         )
         if st.button("Save corrections"):
