@@ -651,24 +651,48 @@ with tab_review:
             "(e.g. to book a late-cycle statement entry into the next month). Tags are freeform labels "
             "for what the spend was (comma-separated for more than one, e.g. 'Lunch, Purchased Card for "
             "Mr. abcd') — used to pick transactions when generating an expense claim in the 🧾 Expense "
-            "Claims tab. Delete a row with the trash icon on its left, then Save."
+            "Claims tab. Suspense is a checkbox for anything you can't classify right now — park it here "
+            "and come back to it later. Delete a row with the trash icon on its left, then Save."
         )
-        show_uncat_only = st.checkbox(
+        f1, f2, f3 = st.columns(3)
+        show_uncat_only = f1.checkbox(
             "Show only Uncategorized",
             value=False,
             help="Off by default so statement uploads with a bank-given category (or an "
                  "auto-matched one) still show up here for you to review and correct.",
         )
-        view = df[df["category"] == "Uncategorized"] if show_uncat_only else df
+        show_suspense_only = f2.checkbox(
+            "Show suspense",
+            value=False,
+            help="Transactions checked as Suspense — not trackable/classifiable right now, parked "
+                 "here to investigate and tag properly later.",
+        )
+        show_unlinked_only = f3.checkbox(
+            "Show unlinked",
+            value=False,
+            help="Transactions with no party at all — not Office, not any person, nothing.",
+        )
+        active_filters = show_uncat_only or show_suspense_only or show_unlinked_only
+        if active_filters:
+            mask = pd.Series(False, index=df.index)
+            if show_uncat_only:
+                mask |= df["category"] == "Uncategorized"
+            if show_suspense_only:
+                mask |= df["is_suspense"]
+            if show_unlinked_only:
+                mask |= df["parties"].apply(lambda ps: len(ps) == 0)
+            view = df[mask]
+        else:
+            view = df
         editable = view[["id", "date", "amount", "direction", "account", "bank",
                           "description", "category", "parties", "tags", "particulars", "month_tag",
-                          "source", "source_file", "edit_source"]].copy()
+                          "is_suspense", "source", "source_file", "edit_source"]].copy()
         editable["parties"] = editable["parties"].apply(lambda ps: ", ".join(ps))
         editable["tags"] = editable["tags"].apply(lambda ts: ", ".join(ts))
         editable["month_tag"] = editable["month_tag"].fillna(editable["date"].dt.strftime("%Y%m"))
         editable = editable.rename(columns={
             "source": "linked from", "source_file": "upload file", "edit_source": "how it was set",
-            "tags": "Tags", "particulars": "Particulars", "month_tag": "Month",
+            "tags": "Tags", "particulars": "Particulars", "month_tag": "Month", "is_suspense": "Suspense",
         })
         editable = one_indexed(editable)
         edited = st.data_editor(
@@ -691,7 +715,9 @@ with tab_review:
                 tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
                 particulars = None if pd.isna(row["Particulars"]) else str(row["Particulars"]).strip() or None
                 month_tag = None if pd.isna(row["Month"]) else str(row["Month"]).strip() or None
-                update_transaction(row["id"], row["category"], is_office, parties, particulars, month_tag, tags)
+                is_suspense = bool(row["Suspense"]) if not pd.isna(row["Suspense"]) else False
+                update_transaction(row["id"], row["category"], is_office, parties, particulars, month_tag,
+                                    tags, is_suspense)
                 apply_correction(row["description"], row["category"], is_office)
                 changed += 1
             msg = f"Updated {changed} rows."
@@ -726,8 +752,9 @@ with tab_review:
                     picked_particulars = None if pd.isna(picked_row["particulars"]) else picked_row["particulars"]
                     picked_month = None if pd.isna(picked_row["month_tag"]) else picked_row["month_tag"]
                     picked_tags = list(picked_row["tags"]) if picked_row["tags"] else []
+                    picked_suspense = bool(picked_row["is_suspense"]) if not pd.isna(picked_row["is_suspense"]) else False
                     update_transaction(picked_id, picked_row["category"], is_office, chosen,
-                                        picked_particulars, picked_month, picked_tags)
+                                        picked_particulars, picked_month, picked_tags, picked_suspense)
                     st.success(f"Parties set to: {', '.join(chosen) if chosen else '(none)'}.")
                     st.rerun()
 

@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS transactions (
     upload_batch_id TEXT,             -- which upload this row came from (upload_batches.id)
     particulars TEXT,                 -- freeform note, editable in Review & Categorize
     month_tag TEXT,                   -- 'YYYYMM', defaults from date but editable (e.g. to book a late-cycle txn into the next month)
-    tags TEXT[]                       -- freeform activity tags, e.g. 'Lunch', 'Purchased Card for Mr. abcd' (0, 1, or many)
+    tags TEXT[],                      -- freeform activity tags, e.g. 'Lunch', 'Purchased Card for Mr. abcd' (0, 1, or many)
+    is_suspense BOOLEAN DEFAULT FALSE -- flagged as not trackable right now; parked here to investigate/tag properly later
 );
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS account_key TEXT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS parties TEXT[];
@@ -54,6 +55,7 @@ ALTER TABLE transactions ADD COLUMN IF NOT EXISTS upload_batch_id TEXT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS particulars TEXT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS month_tag TEXT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS tags TEXT[];
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS is_suspense BOOLEAN DEFAULT FALSE;
 
 CREATE TABLE IF NOT EXISTS category_overrides (
     description_key TEXT PRIMARY KEY,  -- normalized merchant/description snippet
@@ -243,6 +245,7 @@ def upsert_transactions(rows: list[dict]) -> int:
                 r.setdefault("upload_batch_id", None)
                 r.setdefault("particulars", None)
                 r.setdefault("tags", None)
+                r.setdefault("is_suspense", False)
                 if not r.get("month_tag"):
                     date_val = r.get("date")
                     r["month_tag"] = str(date_val).replace("-", "")[:6] if date_val else None
@@ -251,12 +254,12 @@ def upsert_transactions(rows: list[dict]) -> int:
                        (id, date, amount, direction, account, bank, description,
                         category, is_office, source, source_file, raw_text,
                         scrip, quantity, price, charges, account_key, parties,
-                        edit_source, upload_batch_id, particulars, month_tag, tags)
+                        edit_source, upload_batch_id, particulars, month_tag, tags, is_suspense)
                        VALUES (%(id)s, %(date)s, %(amount)s, %(direction)s, %(account)s,
                         %(bank)s, %(description)s, %(category)s, %(is_office)s, %(source)s,
                         %(source_file)s, %(raw_text)s, %(scrip)s, %(quantity)s, %(price)s,
                         %(charges)s, %(account_key)s, %(parties)s, %(edit_source)s, %(upload_batch_id)s,
-                        %(particulars)s, %(month_tag)s, %(tags)s)
+                        %(particulars)s, %(month_tag)s, %(tags)s, %(is_suspense)s)
                        ON CONFLICT (id) DO NOTHING""",
                     r,
                 )
@@ -288,13 +291,13 @@ def get_batch_transactions(batch_id: str) -> list[dict]:
 
 def update_transaction(txn_id: str, category: str, is_office: bool, parties: list[str] | None = None,
                         particulars: str | None = None, month_tag: str | None = None,
-                        tags: list[str] | None = None):
+                        tags: list[str] | None = None, is_suspense: bool = False):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE transactions SET category = %s, is_office = %s, parties = %s, particulars = %s, "
-                "month_tag = %s, tags = %s, edit_source = 'manual' WHERE id = %s",
-                (category, is_office, parties, particulars, month_tag, tags, txn_id),
+                "month_tag = %s, tags = %s, is_suspense = %s, edit_source = 'manual' WHERE id = %s",
+                (category, is_office, parties, particulars, month_tag, tags, is_suspense, txn_id),
             )
 
 
