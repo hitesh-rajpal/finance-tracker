@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS transactions (
     edit_source TEXT,                 -- how category/parties were set: 'sms_tag' | 'bank_category' | 'auto' | 'manual'
     upload_batch_id TEXT,             -- which upload this row came from (upload_batches.id)
     particulars TEXT,                 -- freeform note, editable in Review & Categorize
-    month_tag TEXT                    -- 'YYYYMM', defaults from date but editable (e.g. to book a late-cycle txn into the next month)
+    month_tag TEXT,                   -- 'YYYYMM', defaults from date but editable (e.g. to book a late-cycle txn into the next month)
+    tags TEXT[]                       -- freeform activity tags, e.g. 'Lunch', 'Purchased Card for Mr. abcd' (0, 1, or many)
 );
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS account_key TEXT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS parties TEXT[];
@@ -52,6 +53,7 @@ ALTER TABLE transactions ADD COLUMN IF NOT EXISTS edit_source TEXT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS upload_batch_id TEXT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS particulars TEXT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS month_tag TEXT;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS tags TEXT[];
 
 CREATE TABLE IF NOT EXISTS category_overrides (
     description_key TEXT PRIMARY KEY,  -- normalized merchant/description snippet
@@ -162,6 +164,32 @@ CREATE TABLE IF NOT EXISTS upload_matches (
     matched_transaction_id TEXT,
     match_reason TEXT                 -- 'reference_number' | 'amount_date'
 );
+
+-- One row per "Generate claim" click: a snapshot of which transactions were
+-- handed to accounts together as one reimbursement statement, and where
+-- that statement is in its lifecycle. The Excel itself isn't stored — it's
+-- rebuilt on demand from transaction_ids, so it always matches the DB.
+CREATE TABLE IF NOT EXISTS expense_claims (
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT now(),
+    transaction_ids TEXT[] NOT NULL,
+    total_amount DOUBLE PRECISION NOT NULL,
+    status TEXT NOT NULL DEFAULT 'Generated',  -- 'Generated' | 'Given to Accounts' | 'Payment Received'
+    given_to_accounts_at DATE,
+    payment_id TEXT                   -- set once paid; links to expense_claim_payments.id
+);
+
+-- A single payment from accounts, which can cover more than one claim at
+-- once (e.g. two months' statements settled together in one transfer) —
+-- every expense_claims row it covers points back to it via payment_id.
+CREATE TABLE IF NOT EXISTS expense_claim_payments (
+    id TEXT PRIMARY KEY,
+    payment_date DATE NOT NULL,
+    amount DOUBLE PRECISION NOT NULL,
+    note TEXT,
+    created_at TIMESTAMP DEFAULT now()
+);
 """
 
 
@@ -214,6 +242,7 @@ def upsert_transactions(rows: list[dict]) -> int:
                 r.setdefault("edit_source", None)
                 r.setdefault("upload_batch_id", None)
                 r.setdefault("particulars", None)
+                r.setdefault("tags", None)
                 if not r.get("month_tag"):
                     date_val = r.get("date")
                     r["month_tag"] = str(date_val).replace("-", "")[:6] if date_val else None
@@ -222,12 +251,12 @@ def upsert_transactions(rows: list[dict]) -> int:
                        (id, date, amount, direction, account, bank, description,
                         category, is_office, source, source_file, raw_text,
                         scrip, quantity, price, charges, account_key, parties,
-                        edit_source, upload_batch_id, particulars, month_tag)
+                        edit_source, upload_batch_id, particulars, month_tag, tags)
                        VALUES (%(id)s, %(date)s, %(amount)s, %(direction)s, %(account)s,
                         %(bank)s, %(description)s, %(category)s, %(is_office)s, %(source)s,
                         %(source_file)s, %(raw_text)s, %(scrip)s, %(quantity)s, %(price)s,
                         %(charges)s, %(account_key)s, %(parties)s, %(edit_source)s, %(upload_batch_id)s,
-                        %(particulars)s, %(month_tag)s)
+                        %(particulars)s, %(month_tag)s, %(tags)s)
                        ON CONFLICT (id) DO NOTHING""",
                     r,
                 )
@@ -258,13 +287,14 @@ def get_batch_transactions(batch_id: str) -> list[dict]:
 
 
 def update_transaction(txn_id: str, category: str, is_office: bool, parties: list[str] | None = None,
-                        particulars: str | None = None, month_tag: str | None = None):
+                        particulars: str | None = None, month_tag: str | None = None,
+                        tags: list[str] | None = None):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE transactions SET category = %s, is_office = %s, parties = %s, particulars = %s, "
-                "month_tag = %s, edit_source = 'manual' WHERE id = %s",
-                (category, is_office, parties, particulars, month_tag, txn_id),
+                "month_tag = %s, tags = %s, edit_source = 'manual' WHERE id = %s",
+                (category, is_office, parties, particulars, month_tag, tags, txn_id),
             )
 
 
@@ -523,3 +553,76 @@ def delete_rate_change(change_id: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM loan_rate_changes WHERE id = %s", (change_id,))
+
+
+def save_expense_claim(claim: dict):
+    claim.setdefault("status", "Generated")
+    claim.setdefault("given_to_accounts_at", None)
+    claim.setdefault("payment_id", None)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO expense_claims
+                   (id, label, transaction_ids, total_amount, status, given_to_accounts_at, payment_id)
+                   VALUES (%(id)s, %(label)s, %(transaction_ids)s, %(total_amount)s, %(status)s,
+                    %(given_to_accounts_at)s, %(payment_id)s)""",
+                claim,
+            )
+
+
+def get_expense_claims() -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM expense_claims ORDER BY created_at DESC")
+            return cur.fetchall()
+
+
+def mark_claim_given_to_accounts(claim_id: str, given_date):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE expense_claims SET status = 'Given to Accounts', given_to_accounts_at = %s WHERE id = %s",
+                (given_date, claim_id),
+            )
+
+
+def delete_expense_claim(claim_id: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM expense_claims WHERE id = %s", (claim_id,))
+
+
+def save_claim_payment(payment: dict, claim_ids: list[str]):
+    """Records a payment — possibly covering several claims settled together
+    in one transfer — and marks every one of those claims Payment Received,
+    linked back to this payment."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO expense_claim_payments (id, payment_date, amount, note)
+                   VALUES (%(id)s, %(payment_date)s, %(amount)s, %(note)s)""",
+                payment,
+            )
+            cur.execute(
+                "UPDATE expense_claims SET status = 'Payment Received', payment_id = %s WHERE id = ANY(%s)",
+                (payment["id"], claim_ids),
+            )
+
+
+def get_claim_payments() -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM expense_claim_payments ORDER BY payment_date DESC")
+            return cur.fetchall()
+
+
+def delete_claim_payment(payment_id: str):
+    """Undoes a payment: reverts every claim it covered back to 'Given to
+    Accounts' and removes the payment record."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE expense_claims SET status = 'Given to Accounts', payment_id = NULL WHERE payment_id = %s",
+                (payment_id,),
+            )
+            cur.execute("DELETE FROM expense_claim_payments WHERE id = %s", (payment_id,))

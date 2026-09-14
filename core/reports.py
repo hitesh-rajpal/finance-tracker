@@ -58,6 +58,7 @@ def to_dataframe(rows) -> pd.DataFrame:
         return df
     df["date"] = pd.to_datetime(df["date"])
     df["parties"] = df["parties"].apply(lambda p: list(p) if p else [])
+    df["tags"] = df["tags"].apply(lambda t: list(t) if t else [])
     # parties is the source of truth for is_office going forward: any row
     # whose parties list includes 'Office' (case-insensitive) counts as an
     # office expense, regardless of what's separately stored in is_office —

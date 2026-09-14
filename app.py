@@ -15,6 +15,8 @@ from core.storage import (
     save_upload_batch, get_upload_batches, save_upload_matches, get_upload_matches,
     delete_upload_batch, get_batch_transactions,
     save_statement_profile, get_pdf_passwords, delete_pdf_password,
+    save_expense_claim, get_expense_claims, mark_claim_given_to_accounts, delete_expense_claim,
+    save_claim_payment, get_claim_payments, delete_claim_payment,
 )
 from core.categorize import categorize, apply_correction, is_office_for_category
 from core import reports
@@ -336,10 +338,10 @@ if storage_cfg() and not st.session_state.get("_bucket_ensured"):
 st.title("Office Expenses, Bank & Trading Tracker")
 st.caption("Data is stored in your private Supabase project — accessible only with the app password.")
 
-(tab_upload, tab_uploads_log, tab_review, tab_accounts, tab_parties, tab_reports, tab_trading,
- tab_recon, tab_rules) = st.tabs(
-    ["📥 Upload", "📁 Uploads", "🏷️ Review & Categorize", "🏦 Accounts", "🎭 Parties", "📊 Reports",
-     "📈 Trading", "🔗 Reconciliation", "🎯 Expected & Cross-Check"]
+(tab_upload, tab_uploads_log, tab_review, tab_accounts, tab_parties, tab_claims, tab_reports,
+ tab_trading, tab_recon, tab_rules) = st.tabs(
+    ["📥 Upload", "📁 Uploads", "🏷️ Review & Categorize", "🏦 Accounts", "🎭 Parties", "🧾 Expense Claims",
+     "📊 Reports", "📈 Trading", "🔗 Reconciliation", "🎯 Expected & Cross-Check"]
 )
 
 # ---------------------------------------------------------------- Upload ---
@@ -646,8 +648,10 @@ with tab_review:
             "but you can add any name (comma-separated for more than one, e.g. 'Ram, Sham'). "
             f"Known so far: {', '.join(known_parties) if known_parties else '(none yet)'}. "
             "Particulars is a free note. Month defaults to the transaction's YYYYMM but can be changed "
-            "(e.g. to book a late-cycle statement entry into the next month). "
-            "Delete a row with the trash icon on its left, then Save."
+            "(e.g. to book a late-cycle statement entry into the next month). Tags are freeform labels "
+            "for what the spend was (comma-separated for more than one, e.g. 'Lunch, Purchased Card for "
+            "Mr. abcd') — used to pick transactions when generating an expense claim in the 🧾 Expense "
+            "Claims tab. Delete a row with the trash icon on its left, then Save."
         )
         show_uncat_only = st.checkbox(
             "Show only Uncategorized",
@@ -657,13 +661,14 @@ with tab_review:
         )
         view = df[df["category"] == "Uncategorized"] if show_uncat_only else df
         editable = view[["id", "date", "amount", "direction", "account", "bank",
-                          "description", "category", "parties", "particulars", "month_tag",
+                          "description", "category", "parties", "tags", "particulars", "month_tag",
                           "source", "source_file", "edit_source"]].copy()
         editable["parties"] = editable["parties"].apply(lambda ps: ", ".join(ps))
+        editable["tags"] = editable["tags"].apply(lambda ts: ", ".join(ts))
         editable["month_tag"] = editable["month_tag"].fillna(editable["date"].dt.strftime("%Y%m"))
         editable = editable.rename(columns={
             "source": "linked from", "source_file": "upload file", "edit_source": "how it was set",
-            "particulars": "Particulars", "month_tag": "Month",
+            "tags": "Tags", "particulars": "Particulars", "month_tag": "Month",
         })
         editable = one_indexed(editable)
         edited = st.data_editor(
@@ -682,9 +687,11 @@ with tab_review:
                 is_office = any(p.lower() == "office" for p in parties)
                 for p in parties:
                     ensure_party(p)
+                raw_tags = "" if pd.isna(row["Tags"]) else str(row["Tags"])
+                tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
                 particulars = None if pd.isna(row["Particulars"]) else str(row["Particulars"]).strip() or None
                 month_tag = None if pd.isna(row["Month"]) else str(row["Month"]).strip() or None
-                update_transaction(row["id"], row["category"], is_office, parties, particulars, month_tag)
+                update_transaction(row["id"], row["category"], is_office, parties, particulars, month_tag, tags)
                 apply_correction(row["description"], row["category"], is_office)
                 changed += 1
             msg = f"Updated {changed} rows."
@@ -718,8 +725,9 @@ with tab_review:
                     picked_row = view.loc[view["id"] == picked_id].iloc[0]
                     picked_particulars = None if pd.isna(picked_row["particulars"]) else picked_row["particulars"]
                     picked_month = None if pd.isna(picked_row["month_tag"]) else picked_row["month_tag"]
+                    picked_tags = list(picked_row["tags"]) if picked_row["tags"] else []
                     update_transaction(picked_id, picked_row["category"], is_office, chosen,
-                                        picked_particulars, picked_month)
+                                        picked_particulars, picked_month, picked_tags)
                     st.success(f"Parties set to: {', '.join(chosen) if chosen else '(none)'}.")
                     st.rerun()
 
@@ -800,6 +808,162 @@ with tab_parties:
                 rename_party(rename_from, rename_to.strip())
                 st.success(f"Renamed '{rename_from}' to '{rename_to.strip()}' everywhere.")
                 st.rerun()
+
+# ------------------------------------------------- Expense Claims tab -----
+with tab_claims:
+    df = load_df()
+    if df.empty:
+        st.info("No transactions yet — upload some data first.")
+    else:
+        st.subheader("Generate a new expense claim statement")
+        st.caption(
+            "Pick the transactions to include (unclaimed office debits by default), then Generate — "
+            "this saves a claim record and builds an Excel you can hand to accounts. Tag transactions "
+            "first in 🏷️ Review & Categorize (e.g. 'Lunch', 'Purchased Card for Mr. abcd') if you want "
+            "that context on the statement."
+        )
+
+        claims = get_expense_claims()
+        already_claimed_ids = {tid for c in claims for tid in (c["transaction_ids"] or [])}
+
+        c1, c2, c3 = st.columns(3)
+        min_d, max_d = df["date"].min().date(), df["date"].max().date()
+        start = c1.date_input("From", value=min_d, key="claim_start")
+        end = c2.date_input("To", value=max_d, key="claim_end")
+        office_only = c3.checkbox("Office-tagged only", value=True, key="claim_office_only")
+
+        pool = reports.filter_range(df, start, end)
+        pool = pool[pool["direction"] == "debit"]
+        if office_only:
+            pool = pool[pool["is_office"]]
+        include_claimed = st.checkbox("Include transactions already on another claim", value=False,
+                                       key="claim_include_claimed")
+        if not include_claimed:
+            pool = pool[~pool["id"].isin(already_claimed_ids)]
+
+        if pool.empty:
+            st.caption("No matching transactions in this range.")
+        else:
+            picker = pool[["id", "date", "amount", "account", "bank", "category", "tags",
+                            "particulars", "description"]].copy()
+            picker["tags"] = picker["tags"].apply(lambda ts: ", ".join(ts) if ts else "")
+            picker.insert(0, "Include", True)
+            picker = one_indexed(picker)
+            picked = st.data_editor(
+                picker, use_container_width=True, key="claim_picker",
+                disabled=["id", "date", "amount", "account", "bank", "category", "tags",
+                          "particulars", "description"],
+            )
+            chosen = picked[picked["Include"]]
+            st.metric("Selected total", f"₹{chosen['amount'].sum():,.2f}" if not chosen.empty else "₹0.00")
+            default_label = f"Claim {start} to {end}"
+            label = st.text_input("Claim label", value=default_label, key="claim_label")
+            if st.button("Generate claim & Excel", disabled=chosen.empty):
+                txn_ids = chosen["id"].tolist()
+                total = float(chosen["amount"].sum())
+                claim_id = uuid.uuid4().hex[:16]
+                save_expense_claim({
+                    "id": claim_id, "label": label, "transaction_ids": txn_ids, "total_amount": total,
+                })
+                detail_cols = ["date", "amount", "account", "bank", "category", "tags", "particulars", "description"]
+                detail = chosen[detail_cols].sort_values("date")
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+                    detail.to_excel(xw, sheet_name="Detail", index=False)
+                    pd.DataFrame([{"Label": label, "Total": total, "Count": len(txn_ids),
+                                    "Generated": date.today().isoformat()}]).to_excel(
+                        xw, sheet_name="Summary", index=False)
+                st.session_state["last_claim_excel"] = buf.getvalue()
+                st.session_state["last_claim_filename"] = f"{label.replace(' ', '_')}.xlsx"
+                st.success(f"Claim '{label}' generated — {len(txn_ids)} transaction(s), ₹{total:,.2f}.")
+                st.rerun()
+
+        if st.session_state.get("last_claim_excel"):
+            st.download_button("Download last generated claim (Excel)", st.session_state["last_claim_excel"],
+                                file_name=st.session_state.get("last_claim_filename", "claim.xlsx"))
+
+        st.divider()
+        st.subheader("Claims")
+        if not claims:
+            st.caption("No claims generated yet.")
+        else:
+            payments_by_id = {p["id"]: p for p in get_claim_payments()}
+            claim_choice = {f"{c['label']} [{c['id'][:6]}]": c for c in claims}
+            rows = []
+            for c in claims:
+                pay = payments_by_id.get(c["payment_id"])
+                rows.append({
+                    "Label": c["label"], "Created": c["created_at"], "Count": len(c["transaction_ids"] or []),
+                    "Total": c["total_amount"], "Status": c["status"],
+                    "Given to accounts": c["given_to_accounts_at"],
+                    "Payment date": pay["payment_date"] if pay else None,
+                    "Payment amount": pay["amount"] if pay else None,
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+            st.markdown("#### Mark a claim 'Given to Accounts'")
+            generated = {k: c for k, c in claim_choice.items() if c["status"] == "Generated"}
+            if generated:
+                pick = st.selectbox("Claim", list(generated.keys()), key="give_to_accounts_pick")
+                given_date = st.date_input("Given to accounts on", value=date.today(), key="given_date")
+                if st.button("Mark 'Given to Accounts'"):
+                    mark_claim_given_to_accounts(generated[pick]["id"], given_date)
+                    st.success(f"'{pick}' marked as given to accounts.")
+                    st.rerun()
+            else:
+                st.caption("No claims awaiting hand-off.")
+
+            st.markdown("#### Record a payment (can cover more than one claim)")
+            awaiting = {k: c for k, c in claim_choice.items() if c["status"] == "Given to Accounts"}
+            if awaiting:
+                pay_pick = st.multiselect("Claim(s) this payment covers", list(awaiting.keys()), key="pay_pick")
+                pay_amount = st.number_input("Amount received", min_value=0.0, step=0.01, key="pay_amount")
+                pay_date_in = st.date_input("Payment date", value=date.today(), key="pay_date")
+                pay_note = st.text_input("Note (optional)", key="pay_note")
+                if st.button("Record payment", disabled=not pay_pick):
+                    ids = [awaiting[k]["id"] for k in pay_pick]
+                    payment_id = uuid.uuid4().hex[:16]
+                    save_claim_payment(
+                        {"id": payment_id, "payment_date": pay_date_in, "amount": pay_amount,
+                         "note": pay_note or None},
+                        ids,
+                    )
+                    st.success(f"Payment of ₹{pay_amount:,.2f} recorded for {len(ids)} claim(s).")
+                    st.rerun()
+            else:
+                st.caption("No claims awaiting payment.")
+
+            st.markdown("#### Payments received")
+            paid = get_claim_payments()
+            if paid:
+                for p in paid:
+                    covered = [c["label"] for c in claims if c["payment_id"] == p["id"]]
+                    pc1, pc2 = st.columns([5, 1])
+                    note_suffix = f" — _{p['note']}_" if p.get("note") else ""
+                    pc1.write(
+                        f"₹{p['amount']:,.2f} on {p['payment_date']} — covers: "
+                        f"{', '.join(covered) if covered else '(none linked)'}{note_suffix}"
+                    )
+                    if pc2.button("Undo", key=f"undo_pay_{p['id']}"):
+                        delete_claim_payment(p["id"])
+                        st.success("Payment undone; claim(s) reverted to 'Given to Accounts'.")
+                        st.rerun()
+            else:
+                st.caption("No payments recorded yet.")
+
+            st.markdown("#### Delete a claim")
+            deletable = {k: c for k, c in claim_choice.items() if c["status"] == "Generated"}
+            if deletable:
+                del_pick = st.selectbox("Claim", list(deletable.keys()), key="del_claim_pick")
+                if st.button("Delete claim", key="del_claim_btn"):
+                    delete_expense_claim(deletable[del_pick]["id"])
+                    st.success(f"Deleted '{del_pick}'.")
+                    st.rerun()
+            else:
+                st.caption(
+                    "Only claims still at 'Generated' status can be deleted, to keep the accounts "
+                    "trail intact once a claim has been handed off."
+                )
 
 # -------------------------------------------------------- Reports tab -----
 with tab_reports:
