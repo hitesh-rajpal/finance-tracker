@@ -120,6 +120,37 @@ def _extract_text_line_rows(pdf) -> list[list[str]]:
     return rows
 
 
+# Some ICICI statements (seen on a real Amazon Pay Card statement) bury the
+# transaction list in flowing page text too, but in a different shape: no
+# grid, wrapped around a sidebar rewards chart, each real line reading
+# roughly "DD/MM/YYYY SerNo Description... RewardPoints Amount [CR]" — e.g.
+# "28/07/2026 13872649838 AMAZON PAY INDIA PVT LT BANGALORE IN 115 5,760.00".
+# Debits carry no marker at all (unlike SBI's trailing D/C); only credits
+# get a trailing "CR". Matched with .search rather than .match since chart
+# labels ("49%", "Apparel/Grocery-51% Others-49%") can land on the same
+# line, before the date.
+_ICICI_TEXT_LINE_TXN_RE = re.compile(
+    r"(\d{2}/\d{2}/\d{4})\s+(\d{6,})\s+(.+?)\s+-?\d+\s+([\d,]+\.\d{2})(\s*CR)?\s*$"
+)
+
+
+def _extract_icici_style_rows(pdf) -> list[list[str]]:
+    rows = []
+    for page in pdf.pages:
+        text = page.extract_text() or ""
+        for line in text.split("\n"):
+            m = _ICICI_TEXT_LINE_TXN_RE.search(line.strip())
+            if not m:
+                continue
+            txn_date, ser_no, desc, amount, cr = m.groups()
+            marker = " Cr" if cr else ""
+            # Keep the serial number in the description — it flows into
+            # raw_text and lets dedup match this row against an SMS alert
+            # referencing the same number (see reports._extract_refs).
+            rows.append([txn_date, f"{ser_no} {desc.strip()}", f"{amount}{marker}"])
+    return rows
+
+
 def extract_raw_table(pdf_bytes: bytes, password: str | None = None) -> pd.DataFrame:
     """Best-effort extraction of the transaction table across all pages."""
     all_rows = []
@@ -148,10 +179,21 @@ def extract_raw_table(pdf_bytes: bytes, password: str | None = None) -> pd.DataF
                     if row and any((c or "").strip() for c in row):
                         all_rows.append(row)
 
-        if not all_rows:
-            text_rows = _extract_text_line_rows(pdf)
-            if text_rows:
-                return pd.DataFrame(text_rows, columns=["Date", "Description", "Amount"])
+        # Always also try the plain-text (no-gridline) extractors, even when
+        # the table pass found *some* rows — a small boilerplate/summary
+        # table can pass the date-column filter and quietly stand in for
+        # the real, much longer transaction list (confirmed on a real ICICI
+        # statement: an 8-row refund-only table beat out the real 32-row
+        # list because extract_tables() never saw the real list at all).
+        # Whichever method finds the most rows wins: a correct, complete
+        # extraction is essentially always the largest one, while a
+        # false-positive boilerplate table stays small.
+        text_rows_sbi = _extract_text_line_rows(pdf)
+        text_rows_icici = _extract_icici_style_rows(pdf)
+
+    best_text_rows = max([text_rows_sbi, text_rows_icici], key=len, default=[])
+    if len(best_text_rows) > len(all_rows):
+        return pd.DataFrame(best_text_rows, columns=["Date", "Description", "Amount"])
 
     if not all_rows:
         return pd.DataFrame()
