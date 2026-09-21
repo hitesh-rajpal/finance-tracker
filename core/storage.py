@@ -209,14 +209,33 @@ def _pool() -> SimpleConnectionPool:
 def get_conn():
     pool = _pool()
     conn = pool.getconn()
+    broken = False
     try:
         yield conn
         conn.commit()
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        # A pooled connection can go stale while idle — Supabase's pooler
+        # drops idle connections after a timeout, and a Streamlit Cloud app
+        # can sit unused for hours between visits. Once a connection is
+        # dead, calling rollback() on it just raises a second, more
+        # confusing error that buries the real one, and handing it back to
+        # the pool would make the next request fail the same way. Close
+        # every connection in the pool (all opened around the same time,
+        # so equally likely stale) and drop the cached pool object so the
+        # very next action opens fresh ones instead of repeating this.
+        broken = True
+        try:
+            pool.closeall()
+        except Exception:
+            pass
+        _pool.clear()
+        raise
     except Exception:
         conn.rollback()
         raise
     finally:
-        pool.putconn(conn)
+        if not broken:
+            pool.putconn(conn)
 
 
 def init_db():
