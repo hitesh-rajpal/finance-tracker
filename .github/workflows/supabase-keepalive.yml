@@ -1,0 +1,30 @@
+name: Supabase keepalive
+
+# Supabase's free tier pauses a project after 7 days with no activity.
+# This pings the project's REST API every 3 days so it never goes idle
+# long enough to trigger that. Hitting /rest/v1/ (PostgREST's root) is
+# enough — it touches the live DB connection without needing read access
+# to any specific table, so it works regardless of RLS policies.
+
+on:
+  schedule:
+    - cron: "0 6 */3 * *"   # every 3 days at 06:00 UTC
+  workflow_dispatch: {}      # lets you trigger it manually from the Actions tab to test
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Supabase REST API
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${SUPABASE_URL}/rest/v1/" \
+            -H "apikey: ${SUPABASE_ANON_KEY}")
+          echo "Supabase responded with HTTP $code"
+          if [ "$code" -ge 500 ]; then
+            echo "::error::Supabase keepalive ping failed (HTTP $code)"
+            exit 1
+          fi
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}

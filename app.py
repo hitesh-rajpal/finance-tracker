@@ -23,7 +23,8 @@ from core import reports
 from core import financial_rules as fr
 from core import auth
 from core import file_storage
-from parsers import sms_parser, statement_parser, contract_note_parser
+from parsers import sms_parser, statement_parser, contract_note_parser, dhan_parser
+from core import dhan_reconcile
 
 try:
     from streamlit_cookies_controller import CookieController
@@ -339,9 +340,9 @@ st.title("Office Expenses, Bank & Trading Tracker")
 st.caption("Data is stored in your private Supabase project — accessible only with the app password.")
 
 (tab_upload, tab_uploads_log, tab_review, tab_accounts, tab_parties, tab_claims, tab_reports,
- tab_trading, tab_recon, tab_rules) = st.tabs(
+ tab_trading, tab_recon, tab_dhan, tab_rules) = st.tabs(
     ["📥 Upload", "📁 Uploads", "🏷️ Review & Categorize", "🏦 Accounts", "🎭 Parties", "🧾 Expense Claims",
-     "📊 Reports", "📈 Trading", "🔗 Reconciliation", "🎯 Expected & Cross-Check"]
+     "📊 Reports", "📈 Trading", "🔗 Reconciliation", "🪙 Dhan Recon", "🎯 Expected & Cross-Check"]
 )
 
 # ---------------------------------------------------------------- Upload ---
@@ -1100,6 +1101,97 @@ with tab_recon:
             st.markdown("### Detail")
             st.dataframe(unmatched[["date", "amount", "direction", "description", "account", "bank"]],
                         use_container_width=True)
+
+# ------------------------------------------------------- Dhan Recon tab ---
+with tab_dhan:
+    st.caption(
+        "Upload a batch of Dhan contract note PDFs + the Dhan ledger statement (xls). "
+        "Checks every day's contract note total against the ledger, and checks every "
+        "F&O position's carried-forward price against the next day's opening price — "
+        "a break in that chain usually means a dividend adjustment (NSE adjusts F&O "
+        "contracts for dividends at or above 2% of market value) or a genuine broker error."
+    )
+
+    dhan_pw_saved = get_pdf_passwords()
+    c1, c2 = st.columns(2)
+    with c1:
+        cn_files = st.file_uploader(
+            "Contract note PDFs (select all at once)", type=["pdf"], accept_multiple_files=True,
+            key="dhan_cn_files",
+        )
+    with c2:
+        ledger_file = st.file_uploader("Ledger statement (.xls)", type=["xls", "xlsx"], key="dhan_ledger_file")
+
+    pw_options = ["-- type a new password --"] + [p["label"] for p in dhan_pw_saved]
+    pw_choice = st.selectbox("Contract note password", pw_options, key="dhan_pw_choice")
+    if pw_choice != "-- type a new password --":
+        dhan_password = next(p["password"] for p in dhan_pw_saved if p["label"] == pw_choice)
+    else:
+        dhan_password = st.text_input("Password (usually your PAN)", type="password", key="dhan_pw_typed")
+        save_label = st.text_input("Save as label for next time (optional)", key="dhan_pw_label")
+        if save_label and dhan_password:
+            save_statement_profile(save_label, password=dhan_password)
+
+    if st.button("Run reconciliation", key="dhan_run") and cn_files and ledger_file and dhan_password:
+        contract_notes = {}
+        parse_errors = []
+        for f in cn_files:
+            try:
+                note = dhan_parser.parse_contract_note(f.getvalue(), password=dhan_password)
+            except statement_parser.PasswordRequired:
+                parse_errors.append(f"{f.name}: wrong password")
+                continue
+            if not note["trade_date"]:
+                parse_errors.append(f"{f.name}: couldn't find a trade date — skipped")
+                continue
+            contract_notes[note["trade_date"]] = note
+
+        if parse_errors:
+            st.warning("Some files had issues:\n" + "\n".join(f"- {e}" for e in parse_errors))
+
+        if contract_notes:
+            ledger_df = dhan_parser.parse_ledger(ledger_file.getvalue())
+            ledger_table = dhan_reconcile.ledger_match_table(contract_notes, ledger_df)
+            continuity_table = dhan_reconcile.bfcf_continuity_table(contract_notes)
+            summary = dhan_reconcile.summarize(ledger_table, continuity_table)
+
+            st.session_state["dhan_results"] = {
+                "ledger_table": ledger_table, "continuity_table": continuity_table,
+                "summary": summary,
+            }
+
+    results = st.session_state.get("dhan_results")
+    if results:
+        s = results["summary"]
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Days checked", s["days_checked"])
+        m2.metric("Ledger mismatches", s["ledger_mismatches"])
+        m3.metric("BF/CF links checked", s["continuity_links_checked"])
+        m4.metric("Adjustments/errors found", s["continuity_breaks"])
+
+        st.markdown("### Contract note vs ledger, day by day")
+        lt = results["ledger_table"]
+        st.dataframe(
+            lt.style.map(lambda v: "background-color:#4caf5033" if v == "OK"
+                         else ("background-color:#f4433633" if v == "MISMATCH" else ""),
+                         subset=["status"]),
+            use_container_width=True,
+        )
+
+        st.markdown("### F&O carry-forward price continuity")
+        ct = results["continuity_table"]
+        if ct.empty:
+            st.info("No continuing F&O positions found to check (or only one trading day uploaded).")
+        else:
+            breaks = ct[ct["status"] != "OK"]
+            if breaks.empty:
+                st.success(f"All {len(ct)} BF/CF links match exactly — no dividend adjustments or errors detected.")
+            else:
+                st.error(f"{len(breaks)} break(s) found — check against an actual corporate-action announcement "
+                         "before assuming it's an error:")
+                st.dataframe(breaks, use_container_width=True)
+            with st.expander("Show all links checked"):
+                st.dataframe(ct, use_container_width=True)
 
 # ------------------------------------------------- Expected & Cross-Check -
 with tab_rules:
