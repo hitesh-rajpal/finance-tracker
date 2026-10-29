@@ -1153,10 +1153,14 @@ with tab_dhan:
             ledger_df = dhan_parser.parse_ledger(ledger_file.getvalue())
             ledger_table = dhan_reconcile.ledger_match_table(contract_notes, ledger_df)
             continuity_table = dhan_reconcile.bfcf_continuity_table(contract_notes)
-            summary = dhan_reconcile.summarize(ledger_table, continuity_table)
+            new_position_table = dhan_reconcile.new_position_table(contract_notes)
+            closed_position_table = dhan_reconcile.closed_position_table(contract_notes)
+            summary = dhan_reconcile.summarize(ledger_table, continuity_table,
+                                                new_position_table, closed_position_table)
 
             st.session_state["dhan_results"] = {
                 "ledger_table": ledger_table, "continuity_table": continuity_table,
+                "new_position_table": new_position_table, "closed_position_table": closed_position_table,
                 "summary": summary,
             }
 
@@ -1168,6 +1172,11 @@ with tab_dhan:
         m2.metric("Ledger mismatches", s["ledger_mismatches"])
         m3.metric("BF/CF links checked", s["continuity_links_checked"])
         m4.metric("Adjustments/errors found", s["continuity_breaks"])
+        m5, m6 = st.columns(2)
+        m5.metric("New positions opened", s["new_positions"], delta=f"-{s['new_positions_unmatched']} unmatched"
+                   if s["new_positions_unmatched"] else None)
+        m6.metric("Positions closed", s["closed_positions"], delta=f"-{s['closed_positions_unmatched']} unmatched"
+                   if s["closed_positions_unmatched"] else None)
 
         st.markdown("### Contract note vs ledger, day by day")
         lt = results["ledger_table"]
@@ -1192,6 +1201,36 @@ with tab_dhan:
                 st.dataframe(breaks, use_container_width=True)
             with st.expander("Show all links checked"):
                 st.dataframe(ct, use_container_width=True)
+
+        st.markdown("### New F&O positions — matched to an order?")
+        st.caption("Every position that appears with no prior-day carry-forward should trace back to an "
+                   "actual same-day buy/sell order (including a rollover's opening leg).")
+        npt = results["new_position_table"]
+        if npt.empty:
+            st.info("No new F&O positions opened in this batch.")
+        else:
+            unmatched = npt[npt["status"] != "OK - matched to order"]
+            if unmatched.empty:
+                st.success(f"All {len(npt)} new position(s) matched to a real order.")
+            else:
+                st.error(f"{len(unmatched)} new position(s) with NO matching order found:")
+                st.dataframe(unmatched, use_container_width=True)
+            with st.expander("Show all new positions"):
+                st.dataframe(npt, use_container_width=True)
+
+        st.markdown("### Closed F&O positions — matched to an order?")
+        cpt = results["closed_position_table"]
+        if cpt.empty:
+            st.info("No F&O positions closed in this batch.")
+        else:
+            unmatched = cpt[cpt["status"] != "OK - matched to order"]
+            if unmatched.empty:
+                st.success(f"All {len(cpt)} closed position(s) matched to a real order.")
+            else:
+                st.error(f"{len(unmatched)} closed position(s) with NO matching order found:")
+                st.dataframe(unmatched, use_container_width=True)
+            with st.expander("Show all closed positions"):
+                st.dataframe(cpt, use_container_width=True)
 
 # ------------------------------------------------- Expected & Cross-Check -
 with tab_rules:

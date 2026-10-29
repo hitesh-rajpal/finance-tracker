@@ -58,10 +58,19 @@ def _parse_derivative_rows(lines: list[str]) -> list[dict]:
     own line(s) followed by a BF/CF data line, or (when the description
     is short) the description and BF/CF data on one line.
     """
+    # Dhan wraps a contract's description across 1-2 lines, and which part
+    # comes before vs after the BF/CF/B/S data line is inconsistent (varies
+    # by how long the expiry/exchange suffix is) — so the expiry date can
+    # land either immediately before or immediately after the data row.
+    # A symbol/expiry pulled from only "pending_name" is therefore
+    # unreliable; look one line in both directions for the missing piece.
+    DATE_RE = re.compile(r"\d{2}[A-Za-z]{3}\d{4}")
+
     rows = []
+    row_idx = []  # parallel list: index of the data line for each row, for the lookahead merge
     pending_name = None
-    for line in lines:
-        line = line.strip()
+    for i, raw_line in enumerate(lines):
+        line = raw_line.strip()
         if not line:
             continue
         m1 = re.match(r"^(?:FUTSTK|FUTIDX)\s+(.*?)\s+(BF|CF|B|S)\s+(-?[\d,]+)\s+(.*)$", line)
@@ -87,7 +96,25 @@ def _parse_derivative_rows(lines: list[str]) -> list[dict]:
             "qty": abs(int(qty.replace(",", ""))),
             "wap": float(nums[0].replace(",", "")),
         })
+        row_idx.append(i)
         pending_name = None
+
+    for row, i in zip(rows, row_idx):
+        if DATE_RE.search(row["name"]):
+            continue
+        for j in (i + 1, i - 1):
+            if 0 <= j < len(lines):
+                frag = lines[j].strip()
+                if DATE_RE.search(frag) and not re.match(r"^(FUTSTK|FUTIDX|OPTSTK|OPTIDX|BF|CF|B\s|S\s)", frag):
+                    row["name"] = (row["name"] + " " + frag).strip()
+                    break
+
+    symbol_expiry_re = re.compile(r"(FUTSTK|FUTIDX)\s+([A-Z]+)\s+(\d{2}[A-Za-z]{3}\d{4})")
+    for row in rows:
+        m = symbol_expiry_re.search(row["name"])
+        row["symbol"] = m.group(2) if m else None
+        row["expiry"] = m.group(3) if m else None
+
     return rows
 
 

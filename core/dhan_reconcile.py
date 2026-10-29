@@ -49,37 +49,96 @@ def ledger_match_table(contract_notes: dict, ledger_df: pd.DataFrame) -> pd.Data
     return pd.DataFrame(rows)
 
 
+def _identity(r: dict):
+    """(symbol, expiry, qty) when available, else falls back to (None, None, qty)
+    — the fallback only matters for a row dhan_parser couldn't find a date
+    for, which shouldn't happen in practice but shouldn't crash either."""
+    return (r.get("symbol"), r.get("expiry"), r["qty"])
+
+
 def bfcf_continuity_table(contract_notes: dict) -> pd.DataFrame:
+    """For each F&O position, day N's CF (closing) price must exactly equal
+    day N+1's BF (carried-forward) price for the SAME contract (same
+    symbol+expiry+qty, not just the same qty — two different contracts can
+    share a lot size, e.g. during a rollover week)."""
     dates = sorted(contract_notes)
     rows = []
     for i in range(1, len(dates)):
         prev, cur = dates[i - 1], dates[i]
-        cf_prev = defaultdict(list)
-        for r in contract_notes[prev]["derivative_rows"]:
-            if r["kind"] == "CF":
-                cf_prev[r["qty"]].append((r["name"], r["wap"]))
-        bf_cur = defaultdict(list)
-        for r in contract_notes[cur]["derivative_rows"]:
-            if r["kind"] == "BF":
-                bf_cur[r["qty"]].append((r["name"], r["wap"]))
-        for qty in bf_cur:
-            if qty not in cf_prev:
-                continue
-            prev_list = sorted(cf_prev[qty], key=lambda x: x[1])
-            cur_list = sorted(bf_cur[qty], key=lambda x: x[1])
-            for (pname, prate), (cname, crate) in zip(prev_list, cur_list):
-                diff = round(crate - prate, 4)
-                status = "OK" if abs(diff) < 0.0001 else "ADJUSTMENT/ERROR"
-                rows.append({
-                    "prev_date": prev, "date": cur, "qty": qty,
-                    "contract": cname or pname,
-                    "prev_close": prate, "cur_open": crate,
-                    "diff": diff, "status": status,
-                })
+        cf_prev = {_identity(r): r for r in contract_notes[prev]["derivative_rows"] if r["kind"] == "CF"}
+        bf_cur = {_identity(r): r for r in contract_notes[cur]["derivative_rows"] if r["kind"] == "BF"}
+        for key, bf in bf_cur.items():
+            cf = cf_prev.get(key)
+            if cf is None:
+                continue  # no prior-day CF for this exact contract — see new_position_table
+            diff = round(bf["wap"] - cf["wap"], 4)
+            status = "OK" if abs(diff) < 0.0001 else "ADJUSTMENT/ERROR"
+            rows.append({
+                "prev_date": prev, "date": cur, "contract": bf["name"], "qty": bf["qty"],
+                "prev_close": cf["wap"], "cur_open": bf["wap"],
+                "diff": diff, "status": status,
+            })
     return pd.DataFrame(rows)
 
 
-def summarize(ledger_table: pd.DataFrame, continuity_table: pd.DataFrame) -> dict:
+def new_position_table(contract_notes: dict) -> pd.DataFrame:
+    """Flags every F&O position that appears (as a CF row) with no matching
+    prior-day CF-continuity — i.e. a brand-new position opened that day —
+    and checks it's backed by an actual same-day B/S order at the same
+    quantity. A position with no matching order is a red flag: either a
+    missing contract note somewhere, or a genuine data error."""
+    dates = sorted(contract_notes)
+    rows = []
+    for idx, date in enumerate(dates):
+        note = contract_notes[date]
+        bf_keys = {_identity(r) for r in note["derivative_rows"] if r["kind"] == "BF"}
+        cf_rows = [r for r in note["derivative_rows"] if r["kind"] == "CF"]
+        trade_rows = [r for r in note["derivative_rows"] if r["kind"] in ("B", "S")]
+        for cf in cf_rows:
+            key = _identity(cf)
+            if key in bf_keys:
+                continue  # continuing position, carried from a same-day BF
+            match = next((t for t in trade_rows if _identity(t)[2] == key[2]
+                          and t.get("symbol") == key[0] and t.get("expiry") == key[1]), None)
+            rows.append({
+                "date": date, "contract": cf["name"], "qty": cf["qty"],
+                "matched_order": f"{match['kind']} @ {match['wap']}" if match else None,
+                "status": "OK - matched to order" if match else "NO MATCHING ORDER FOUND",
+            })
+    return pd.DataFrame(rows)
+
+
+def closed_position_table(contract_notes: dict) -> pd.DataFrame:
+    """The mirror check: a position that had a BF (still open coming into
+    the day) but no CF that day (not carried forward — closed) should be
+    backed by a same-day closing B/S order."""
+    dates = sorted(contract_notes)
+    rows = []
+    for date in dates:
+        note = contract_notes[date]
+        cf_keys = {_identity(r) for r in note["derivative_rows"] if r["kind"] == "CF"}
+        bf_rows = [r for r in note["derivative_rows"] if r["kind"] == "BF"]
+        trade_rows = [r for r in note["derivative_rows"] if r["kind"] in ("B", "S")]
+        for bf in bf_rows:
+            key = _identity(bf)
+            if key in cf_keys:
+                continue  # still open at day's close
+            match = next((t for t in trade_rows if _identity(t)[2] == key[2]
+                          and t.get("symbol") == key[0] and t.get("expiry") == key[1]), None)
+            rows.append({
+                "date": date, "contract": bf["name"], "qty": bf["qty"],
+                "matched_order": f"{match['kind']} @ {match['wap']}" if match else None,
+                "status": "OK - matched to order" if match else "NO MATCHING ORDER FOUND",
+            })
+    return pd.DataFrame(rows)
+
+
+def summarize(ledger_table: pd.DataFrame, continuity_table: pd.DataFrame,
+              new_position_tbl: pd.DataFrame | None = None,
+              closed_position_tbl: pd.DataFrame | None = None) -> dict:
+    def _unmatched(df):
+        return int((df["status"] == "NO MATCHING ORDER FOUND").sum()) if df is not None and not df.empty else 0
+
     return {
         "days_checked": len(ledger_table),
         "ledger_mismatches": int((ledger_table["status"] == "MISMATCH").sum()),
@@ -87,4 +146,8 @@ def summarize(ledger_table: pd.DataFrame, continuity_table: pd.DataFrame) -> dic
         "continuity_links_checked": len(continuity_table),
         "continuity_breaks": int((continuity_table["status"] == "ADJUSTMENT/ERROR").sum())
                               if not continuity_table.empty else 0,
+        "new_positions": len(new_position_tbl) if new_position_tbl is not None else 0,
+        "new_positions_unmatched": _unmatched(new_position_tbl),
+        "closed_positions": len(closed_position_tbl) if closed_position_tbl is not None else 0,
+        "closed_positions_unmatched": _unmatched(closed_position_tbl),
     }
