@@ -1259,9 +1259,11 @@ with tab_investments:
         p_total_invested = c9.number_input("Total invested so far (₹)", min_value=0.0, step=10000.0)
         p_premiums_paid = c10.number_input("Premiums paid", min_value=0, step=1)
         p_total_premiums = c11.number_input("Total premiums (policy term)", min_value=0, step=1)
-        c12, c13 = st.columns(2)
+        c12, c13, c14, c15 = st.columns(4)
         p_maturity = c12.date_input("Maturity date", value=None)
         p_auto_debit = c13.selectbox("Auto-debit (SI/ECS) set up?", ["Unknown", "Yes", "No"])
+        p_holder = c14.text_input("Policy holder", placeholder="e.g. Hitesh Rajpal")
+        p_nominee = c15.text_input("Nominee", placeholder="e.g. Manisha Rajpal")
         if st.button("Save policy"):
             if not p_label:
                 st.error("Give it a label first.")
@@ -1275,6 +1277,7 @@ with tab_investments:
                     premiums_paid=p_premiums_paid or None, total_premiums=p_total_premiums or None,
                     maturity_date=p_maturity.isoformat() if p_maturity else None,
                     auto_debit_set_up={"Yes": True, "No": False, "Unknown": None}[p_auto_debit],
+                    policy_holder=p_holder or None, nominee=p_nominee or None,
                 )
                 st.success(f"Saved '{p_label}'.")
                 st.rerun()
@@ -1286,6 +1289,16 @@ with tab_investments:
         sel_label = st.selectbox("Policy", list(policy_options.keys()))
         policy = next(p for p in policies if p["label"] == sel_label)
         key = policy["key"]
+
+        holder_bits = []
+        if policy["policy_holder"]:
+            holder_bits.append(f"Holder: **{policy['policy_holder']}**")
+        if policy["nominee"]:
+            holder_bits.append(f"Nominee: **{policy['nominee']}**")
+        if policy["policy_no"]:
+            holder_bits.append(f"Policy No. **{policy['policy_no']}**")
+        if holder_bits:
+            st.caption(" | ".join(holder_bits))
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Premium", f"₹{policy['premium_amount']:,.0f} / {policy['premium_frequency']}"
