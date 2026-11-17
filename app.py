@@ -1,5 +1,6 @@
 import hmac
 import io
+import re
 import uuid
 from datetime import date
 
@@ -17,6 +18,8 @@ from core.storage import (
     save_statement_profile, get_pdf_passwords, delete_pdf_password,
     save_expense_claim, get_expense_claims, mark_claim_given_to_accounts, delete_expense_claim,
     save_claim_payment, get_claim_payments, delete_claim_payment,
+    save_investment_policy, get_investment_policies, save_investment_snapshot,
+    get_investment_snapshots, get_investment_snapshot_funds, delete_investment_snapshot,
 )
 from core.categorize import categorize, apply_correction, is_office_for_category
 from core import reports
@@ -340,9 +343,9 @@ st.title("Office Expenses, Bank & Trading Tracker")
 st.caption("Data is stored in your private Supabase project — accessible only with the app password.")
 
 (tab_upload, tab_uploads_log, tab_review, tab_accounts, tab_parties, tab_claims, tab_reports,
- tab_trading, tab_recon, tab_dhan, tab_rules) = st.tabs(
+ tab_trading, tab_recon, tab_dhan, tab_investments, tab_rules) = st.tabs(
     ["📥 Upload", "📁 Uploads", "🏷️ Review & Categorize", "🏦 Accounts", "🎭 Parties", "🧾 Expense Claims",
-     "📊 Reports", "📈 Trading", "🔗 Reconciliation", "🪙 Dhan Recon", "🎯 Expected & Cross-Check"]
+     "📊 Reports", "📈 Trading", "🔗 Reconciliation", "🪙 Dhan Recon", "💹 Investments", "🎯 Expected & Cross-Check"]
 )
 
 # ---------------------------------------------------------------- Upload ---
@@ -1231,6 +1234,90 @@ with tab_dhan:
                 st.dataframe(unmatched, use_container_width=True)
             with st.expander("Show all closed positions"):
                 st.dataframe(cpt, use_container_width=True)
+
+# --------------------------------------------------------- Investments ---
+with tab_investments:
+    st.caption("Track ULIP/investment policies that live outside bank statements — fund value is a "
+               "point-in-time snapshot you (or another tool via API) check and record periodically, "
+               "not something derived from transactions.")
+
+    policies = get_investment_policies()
+    policy_options = {p["label"]: p["key"] for p in policies}
+
+    with st.expander("➕ Add / update a policy", expanded=not policies):
+        c1, c2, c3 = st.columns(3)
+        p_label = c1.text_input("Label", placeholder="e.g. IndusInd Nippon Life Premier (ULIP)")
+        p_insurer = c2.text_input("Insurer", placeholder="e.g. IndusInd Nippon")
+        p_policy_no = c3.text_input("Policy No.")
+        c4, c5, c6, c7 = st.columns(4)
+        p_type = c4.text_input("Type", value="ULIP")
+        p_premium = c5.number_input("Premium (₹)", min_value=0.0, step=1000.0)
+        p_freq = c6.selectbox("Premium frequency", ["Yearly", "Quarterly", "Monthly"])
+        p_due = c7.date_input("Next premium due", value=None)
+        p_sum_assured = st.number_input("Sum assured (₹)", min_value=0.0, step=10000.0)
+        if st.button("Save policy"):
+            if not p_label:
+                st.error("Give it a label first.")
+            else:
+                key = re.sub(r"[^a-z0-9]+", "_", p_label.lower()).strip("_")
+                save_investment_policy(
+                    key, p_label, insurer=p_insurer or None, policy_no=p_policy_no or None,
+                    policy_type=p_type or None, premium_amount=p_premium or None,
+                    premium_frequency=p_freq, next_premium_due=p_due.isoformat() if p_due else None,
+                    sum_assured=p_sum_assured or None,
+                )
+                st.success(f"Saved '{p_label}'.")
+                st.rerun()
+
+    st.divider()
+    if not policies:
+        st.info("No policies yet — add one above.")
+    else:
+        sel_label = st.selectbox("Policy", list(policy_options.keys()))
+        policy = next(p for p in policies if p["label"] == sel_label)
+        key = policy["key"]
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Premium", f"₹{policy['premium_amount']:,.0f} / {policy['premium_frequency']}"
+                   if policy["premium_amount"] else "—")
+        c2.metric("Next due", str(policy["next_premium_due"]) if policy["next_premium_due"] else "—")
+        c3.metric("Sum assured", f"₹{policy['sum_assured']:,.0f}" if policy["sum_assured"] else "—")
+
+        snapshots = get_investment_snapshots(key)
+        latest = snapshots[0] if snapshots else None
+        if latest:
+            st.metric(f"Fund value (as of {latest['as_of_date']})", f"₹{latest['total_value']:,.2f}")
+
+        with st.expander("➕ Record a fund value snapshot"):
+            s_date = st.date_input("As of date", value=date.today(), key="snap_date")
+            st.caption("Enter each fund's value — add rows as needed. Fund names/count can change "
+                       "any time, so nothing here is fixed.")
+            n_funds = st.number_input("Number of funds", min_value=1, value=3, step=1, key="snap_nfunds")
+            funds = []
+            for i in range(int(n_funds)):
+                fc1, fc2, fc3, fc4 = st.columns(4)
+                fname = fc1.text_input("Fund name", key=f"snap_fname_{i}")
+                funits = fc2.number_input("Units", min_value=0.0, step=0.01, key=f"snap_funits_{i}", format="%.2f")
+                fnav = fc3.number_input("NAV", min_value=0.0, step=0.01, key=f"snap_fnav_{i}", format="%.2f")
+                fvalue = fc4.number_input("Value (₹)", min_value=0.0, step=1.0, key=f"snap_fvalue_{i}")
+                if fname and fvalue:
+                    funds.append({"fund_name": fname, "units": funits or None, "nav": fnav or None, "value": fvalue})
+            total_entered = sum(f["value"] for f in funds)
+            st.caption(f"Total of funds entered: ₹{total_entered:,.2f}")
+            if st.button("Save snapshot"):
+                if not funds:
+                    st.error("Enter at least one fund with a value.")
+                else:
+                    save_investment_snapshot(key, s_date.isoformat(), total_entered, funds, source="manual")
+                    st.success(f"Saved snapshot as of {s_date} — total ₹{total_entered:,.2f}")
+                    st.rerun()
+
+        if snapshots:
+            st.markdown("### History")
+            hist_df = pd.DataFrame(snapshots)[["as_of_date", "total_value", "source"]]
+            st.dataframe(hist_df, use_container_width=True)
+            with st.expander("Fund breakdown for latest snapshot"):
+                st.dataframe(pd.DataFrame(get_investment_snapshot_funds(latest["id"])), use_container_width=True)
 
 # ------------------------------------------------- Expected & Cross-Check -
 with tab_rules:

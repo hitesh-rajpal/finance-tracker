@@ -14,6 +14,7 @@ A small psycopg2 pool is kept across Streamlit reruns via st.cache_resource
 so we don't open a fresh connection on every script rerun.
 """
 import hashlib
+import uuid
 from contextlib import contextmanager
 
 import streamlit as st
@@ -180,6 +181,47 @@ CREATE TABLE IF NOT EXISTS expense_claims (
     status TEXT NOT NULL DEFAULT 'Generated',  -- 'Generated' | 'Given to Accounts' | 'Payment Received'
     given_to_accounts_at DATE,
     payment_id TEXT                   -- set once paid; links to expense_claim_payments.id
+);
+
+-- A ULIP/investment policy's static details — premium schedule, sum assured
+-- etc. Fund value itself is NOT here: that's a point-in-time snapshot (see
+-- investment_value_snapshots below) since it moves with the market.
+CREATE TABLE IF NOT EXISTS investment_policies (
+    key TEXT PRIMARY KEY,              -- user-chosen short key, e.g. 'indusind_nippon_ulip'
+    label TEXT NOT NULL,               -- e.g. 'IndusInd Nippon Life Premier (ULIP)'
+    insurer TEXT,
+    policy_no TEXT,
+    policy_type TEXT,                  -- e.g. 'ULIP'
+    premium_amount DOUBLE PRECISION,
+    premium_frequency TEXT,            -- 'Yearly' | 'Quarterly' | 'Monthly'
+    next_premium_due DATE,
+    sum_assured DOUBLE PRECISION
+);
+
+-- One row per time the fund value was checked. total_value is what's shown
+-- as the headline number; the actual fund-by-fund split lives in
+-- investment_value_funds below, since which funds exist and what they're
+-- named can change over time (switches, insurer renaming a fund, etc.) —
+-- never assume a fixed set of fund columns.
+CREATE TABLE IF NOT EXISTS investment_value_snapshots (
+    id TEXT PRIMARY KEY,
+    policy_key TEXT NOT NULL,
+    as_of_date DATE NOT NULL,
+    total_value DOUBLE PRECISION NOT NULL,
+    source TEXT,                       -- how this number was obtained, e.g. 'manual' | 'api'
+    created_at TIMESTAMP DEFAULT now()
+);
+
+-- Per-fund breakdown for one snapshot. fund_name is free text on purpose —
+-- insurers add/rename/merge funds, so this must never be an enum or a fixed
+-- column set.
+CREATE TABLE IF NOT EXISTS investment_value_funds (
+    id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL,
+    fund_name TEXT NOT NULL,
+    units DOUBLE PRECISION,
+    nav DOUBLE PRECISION,
+    value DOUBLE PRECISION NOT NULL
 );
 
 -- A single payment from accounts, which can cover more than one claim at
@@ -472,6 +514,92 @@ def get_overrides() -> dict:
             cur.execute("SELECT * FROM category_overrides")
             rows = cur.fetchall()
     return {r["description_key"]: (r["category"], bool(r["is_office"])) for r in rows}
+
+
+def save_investment_policy(key: str, label: str, insurer: str | None = None, policy_no: str | None = None,
+                            policy_type: str | None = None, premium_amount: float | None = None,
+                            premium_frequency: str | None = None, next_premium_due: str | None = None,
+                            sum_assured: float | None = None):
+    """Upserts a policy's static details by key — a field left as None keeps
+    whatever was already stored, same COALESCE pattern as save_statement_profile."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO investment_policies
+                     (key, label, insurer, policy_no, policy_type, premium_amount,
+                      premium_frequency, next_premium_due, sum_assured)
+                   VALUES (%(key)s, %(label)s, %(insurer)s, %(policy_no)s, %(policy_type)s,
+                           %(premium_amount)s, %(premium_frequency)s, %(next_premium_due)s, %(sum_assured)s)
+                   ON CONFLICT (key) DO UPDATE SET
+                     label = EXCLUDED.label,
+                     insurer = COALESCE(EXCLUDED.insurer, investment_policies.insurer),
+                     policy_no = COALESCE(EXCLUDED.policy_no, investment_policies.policy_no),
+                     policy_type = COALESCE(EXCLUDED.policy_type, investment_policies.policy_type),
+                     premium_amount = COALESCE(EXCLUDED.premium_amount, investment_policies.premium_amount),
+                     premium_frequency = COALESCE(EXCLUDED.premium_frequency, investment_policies.premium_frequency),
+                     next_premium_due = COALESCE(EXCLUDED.next_premium_due, investment_policies.next_premium_due),
+                     sum_assured = COALESCE(EXCLUDED.sum_assured, investment_policies.sum_assured)""",
+                {"key": key, "label": label, "insurer": insurer, "policy_no": policy_no,
+                 "policy_type": policy_type, "premium_amount": premium_amount,
+                 "premium_frequency": premium_frequency, "next_premium_due": next_premium_due,
+                 "sum_assured": sum_assured},
+            )
+
+
+def get_investment_policies() -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM investment_policies ORDER BY label")
+            return cur.fetchall()
+
+
+def save_investment_snapshot(policy_key: str, as_of_date: str, total_value: float,
+                              funds: list[dict], source: str = "manual") -> str:
+    """funds: [{'fund_name':..., 'units':..., 'nav':..., 'value':...}, ...]
+    Returns the new snapshot's id."""
+    snapshot_id = str(uuid.uuid4())
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO investment_value_snapshots (id, policy_key, as_of_date, total_value, source)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (snapshot_id, policy_key, as_of_date, total_value, source),
+            )
+            for f in funds:
+                cur.execute(
+                    """INSERT INTO investment_value_funds (id, snapshot_id, fund_name, units, nav, value)
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (str(uuid.uuid4()), snapshot_id, f["fund_name"], f.get("units"), f.get("nav"), f["value"]),
+                )
+    return snapshot_id
+
+
+def get_investment_snapshots(policy_key: str | None = None) -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if policy_key:
+                cur.execute(
+                    "SELECT * FROM investment_value_snapshots WHERE policy_key = %s ORDER BY as_of_date DESC",
+                    (policy_key,),
+                )
+            else:
+                cur.execute("SELECT * FROM investment_value_snapshots ORDER BY as_of_date DESC")
+            return cur.fetchall()
+
+
+def get_investment_snapshot_funds(snapshot_id: str) -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM investment_value_funds WHERE snapshot_id = %s ORDER BY fund_name",
+                        (snapshot_id,))
+            return cur.fetchall()
+
+
+def delete_investment_snapshot(snapshot_id: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM investment_value_funds WHERE snapshot_id = %s", (snapshot_id,))
+            cur.execute("DELETE FROM investment_value_snapshots WHERE id = %s", (snapshot_id,))
 
 
 def ensure_account(key: str, default_label: str):
