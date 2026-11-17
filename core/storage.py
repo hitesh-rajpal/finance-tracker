@@ -193,10 +193,20 @@ CREATE TABLE IF NOT EXISTS investment_policies (
     policy_no TEXT,
     policy_type TEXT,                  -- e.g. 'ULIP'
     premium_amount DOUBLE PRECISION,
-    premium_frequency TEXT,            -- 'Yearly' | 'Quarterly' | 'Monthly'
+    premium_frequency TEXT,            -- 'Yearly' | 'Half-Yearly' | 'Quarterly' | 'Monthly'
     next_premium_due DATE,
-    sum_assured DOUBLE PRECISION
+    sum_assured DOUBLE PRECISION,
+    total_invested DOUBLE PRECISION,   -- sum of premiums paid so far, if known
+    premiums_paid INTEGER,
+    total_premiums INTEGER,            -- e.g. 24 of 40 paid
+    maturity_date DATE,
+    auto_debit_set_up BOOLEAN
 );
+ALTER TABLE investment_policies ADD COLUMN IF NOT EXISTS total_invested DOUBLE PRECISION;
+ALTER TABLE investment_policies ADD COLUMN IF NOT EXISTS premiums_paid INTEGER;
+ALTER TABLE investment_policies ADD COLUMN IF NOT EXISTS total_premiums INTEGER;
+ALTER TABLE investment_policies ADD COLUMN IF NOT EXISTS maturity_date DATE;
+ALTER TABLE investment_policies ADD COLUMN IF NOT EXISTS auto_debit_set_up BOOLEAN;
 
 -- One row per time the fund value was checked. total_value is what's shown
 -- as the headline number; the actual fund-by-fund split lives in
@@ -519,7 +529,9 @@ def get_overrides() -> dict:
 def save_investment_policy(key: str, label: str, insurer: str | None = None, policy_no: str | None = None,
                             policy_type: str | None = None, premium_amount: float | None = None,
                             premium_frequency: str | None = None, next_premium_due: str | None = None,
-                            sum_assured: float | None = None):
+                            sum_assured: float | None = None, total_invested: float | None = None,
+                            premiums_paid: int | None = None, total_premiums: int | None = None,
+                            maturity_date: str | None = None, auto_debit_set_up: bool | None = None):
     """Upserts a policy's static details by key — a field left as None keeps
     whatever was already stored, same COALESCE pattern as save_statement_profile."""
     with get_conn() as conn:
@@ -527,9 +539,12 @@ def save_investment_policy(key: str, label: str, insurer: str | None = None, pol
             cur.execute(
                 """INSERT INTO investment_policies
                      (key, label, insurer, policy_no, policy_type, premium_amount,
-                      premium_frequency, next_premium_due, sum_assured)
+                      premium_frequency, next_premium_due, sum_assured, total_invested,
+                      premiums_paid, total_premiums, maturity_date, auto_debit_set_up)
                    VALUES (%(key)s, %(label)s, %(insurer)s, %(policy_no)s, %(policy_type)s,
-                           %(premium_amount)s, %(premium_frequency)s, %(next_premium_due)s, %(sum_assured)s)
+                           %(premium_amount)s, %(premium_frequency)s, %(next_premium_due)s, %(sum_assured)s,
+                           %(total_invested)s, %(premiums_paid)s, %(total_premiums)s, %(maturity_date)s,
+                           %(auto_debit_set_up)s)
                    ON CONFLICT (key) DO UPDATE SET
                      label = EXCLUDED.label,
                      insurer = COALESCE(EXCLUDED.insurer, investment_policies.insurer),
@@ -538,11 +553,18 @@ def save_investment_policy(key: str, label: str, insurer: str | None = None, pol
                      premium_amount = COALESCE(EXCLUDED.premium_amount, investment_policies.premium_amount),
                      premium_frequency = COALESCE(EXCLUDED.premium_frequency, investment_policies.premium_frequency),
                      next_premium_due = COALESCE(EXCLUDED.next_premium_due, investment_policies.next_premium_due),
-                     sum_assured = COALESCE(EXCLUDED.sum_assured, investment_policies.sum_assured)""",
+                     sum_assured = COALESCE(EXCLUDED.sum_assured, investment_policies.sum_assured),
+                     total_invested = COALESCE(EXCLUDED.total_invested, investment_policies.total_invested),
+                     premiums_paid = COALESCE(EXCLUDED.premiums_paid, investment_policies.premiums_paid),
+                     total_premiums = COALESCE(EXCLUDED.total_premiums, investment_policies.total_premiums),
+                     maturity_date = COALESCE(EXCLUDED.maturity_date, investment_policies.maturity_date),
+                     auto_debit_set_up = COALESCE(EXCLUDED.auto_debit_set_up, investment_policies.auto_debit_set_up)""",
                 {"key": key, "label": label, "insurer": insurer, "policy_no": policy_no,
                  "policy_type": policy_type, "premium_amount": premium_amount,
                  "premium_frequency": premium_frequency, "next_premium_due": next_premium_due,
-                 "sum_assured": sum_assured},
+                 "sum_assured": sum_assured, "total_invested": total_invested,
+                 "premiums_paid": premiums_paid, "total_premiums": total_premiums,
+                 "maturity_date": maturity_date, "auto_debit_set_up": auto_debit_set_up},
             )
 
 

@@ -1252,9 +1252,16 @@ with tab_investments:
         c4, c5, c6, c7 = st.columns(4)
         p_type = c4.text_input("Type", value="ULIP")
         p_premium = c5.number_input("Premium (₹)", min_value=0.0, step=1000.0)
-        p_freq = c6.selectbox("Premium frequency", ["Yearly", "Quarterly", "Monthly"])
+        p_freq = c6.selectbox("Premium frequency", ["Yearly", "Half-Yearly", "Quarterly", "Monthly"])
         p_due = c7.date_input("Next premium due", value=None)
-        p_sum_assured = st.number_input("Sum assured (₹)", min_value=0.0, step=10000.0)
+        c8, c9, c10, c11 = st.columns(4)
+        p_sum_assured = c8.number_input("Sum assured (₹)", min_value=0.0, step=10000.0)
+        p_total_invested = c9.number_input("Total invested so far (₹)", min_value=0.0, step=10000.0)
+        p_premiums_paid = c10.number_input("Premiums paid", min_value=0, step=1)
+        p_total_premiums = c11.number_input("Total premiums (policy term)", min_value=0, step=1)
+        c12, c13 = st.columns(2)
+        p_maturity = c12.date_input("Maturity date", value=None)
+        p_auto_debit = c13.selectbox("Auto-debit (SI/ECS) set up?", ["Unknown", "Yes", "No"])
         if st.button("Save policy"):
             if not p_label:
                 st.error("Give it a label first.")
@@ -1264,7 +1271,10 @@ with tab_investments:
                     key, p_label, insurer=p_insurer or None, policy_no=p_policy_no or None,
                     policy_type=p_type or None, premium_amount=p_premium or None,
                     premium_frequency=p_freq, next_premium_due=p_due.isoformat() if p_due else None,
-                    sum_assured=p_sum_assured or None,
+                    sum_assured=p_sum_assured or None, total_invested=p_total_invested or None,
+                    premiums_paid=p_premiums_paid or None, total_premiums=p_total_premiums or None,
+                    maturity_date=p_maturity.isoformat() if p_maturity else None,
+                    auto_debit_set_up={"Yes": True, "No": False, "Unknown": None}[p_auto_debit],
                 )
                 st.success(f"Saved '{p_label}'.")
                 st.rerun()
@@ -1277,16 +1287,33 @@ with tab_investments:
         policy = next(p for p in policies if p["label"] == sel_label)
         key = policy["key"]
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Premium", f"₹{policy['premium_amount']:,.0f} / {policy['premium_frequency']}"
                    if policy["premium_amount"] else "—")
         c2.metric("Next due", str(policy["next_premium_due"]) if policy["next_premium_due"] else "—")
         c3.metric("Sum assured", f"₹{policy['sum_assured']:,.0f}" if policy["sum_assured"] else "—")
+        if policy["premiums_paid"] is not None and policy["total_premiums"]:
+            c4.metric("Premiums paid", f"{policy['premiums_paid']} of {policy['total_premiums']}")
+        else:
+            c4.metric("Premiums paid", "—")
+
+        c5, c6, c7 = st.columns(3)
+        c5.metric("Total invested", f"₹{policy['total_invested']:,.0f}" if policy["total_invested"] else "—")
+        c6.metric("Maturity", str(policy["maturity_date"]) if policy["maturity_date"] else "—")
+        auto_debit_label = {True: "Yes", False: "No ⚠️ pay manually", None: "Unknown"}[policy["auto_debit_set_up"]]
+        c7.metric("Auto-debit set up", auto_debit_label)
 
         snapshots = get_investment_snapshots(key)
         latest = snapshots[0] if snapshots else None
         if latest:
-            st.metric(f"Fund value (as of {latest['as_of_date']})", f"₹{latest['total_value']:,.2f}")
+            gain = None
+            if policy["total_invested"]:
+                gain = latest["total_value"] - policy["total_invested"]
+                gain_pct = gain / policy["total_invested"] * 100
+            fc1, fc2 = st.columns(2)
+            fc1.metric(f"Fund value (as of {latest['as_of_date']})", f"₹{latest['total_value']:,.2f}")
+            if gain is not None:
+                fc2.metric("Gain vs. invested", f"₹{gain:,.0f}", delta=f"{gain_pct:.1f}%")
 
         with st.expander("➕ Record a fund value snapshot"):
             s_date = st.date_input("As of date", value=date.today(), key="snap_date")
