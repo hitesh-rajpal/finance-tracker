@@ -39,6 +39,18 @@ st.set_page_config(page_title="Finance Tracker", layout="wide")
 REMEMBER_COOKIE = "finance_tracker_remember_token"
 REMEMBER_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
 
+# Full-UI access (this Streamlit app's own login) is intentionally narrower
+# than "any valid Supabase Auth user" — a login created only for scoped API/
+# RLS access (e.g. an external tool pushing investment snapshots) must NOT
+# also be able to sign into the app itself, since the app's own DB access
+# goes through a direct Postgres connection that bypasses RLS entirely and
+# would hand that login everything (transactions, PDF passwords, all of it).
+ALLOWED_APP_EMAILS = {"hiteshrajpal@gmail.com"}
+
+
+def _email_allowed(email: str) -> bool:
+    return (email or "").strip().lower() in ALLOWED_APP_EMAILS
+
 
 def _legacy_password_gate():
     """Old single-shared-password check — kept only as a fallback for while
@@ -90,23 +102,27 @@ def require_login():
         remembered = controller.get(REMEMBER_COOKIE)
         if remembered:
             ok, result = auth.refresh_session(auth_cfg["url"], auth_cfg["anon_key"], remembered)
-            if ok:
+            if ok and _email_allowed(result.get("user", {}).get("email", "")):
                 st.session_state["authenticated"] = True
                 st.session_state["user_email"] = result.get("user", {}).get("email", "")
                 new_refresh = result.get("refresh_token")
                 if new_refresh:
                     controller.set(REMEMBER_COOKIE, new_refresh, max_age=REMEMBER_MAX_AGE)
                 st.rerun()
+            elif ok:
+                controller.remove(REMEMBER_COOKIE)  # valid login, but not allowed into the app UI
 
     def on_submit():
         email = st.session_state.get("login_email", "").strip()
         password = st.session_state.get("login_password", "")
         ok, result = auth.sign_in(auth_cfg["url"], auth_cfg["anon_key"], email, password)
-        if ok:
+        if ok and _email_allowed(result.get("user", {}).get("email", "")):
             st.session_state["authenticated"] = True
             st.session_state["user_email"] = result.get("user", {}).get("email", "")
             if st.session_state.get("remember_me") and controller is not None:
                 controller.set(REMEMBER_COOKIE, result["refresh_token"], max_age=REMEMBER_MAX_AGE)
+        elif ok:
+            st.session_state["auth_failed"] = "This login isn't authorized for the app UI."
         else:
             st.session_state["auth_failed"] = result
 
