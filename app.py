@@ -20,6 +20,7 @@ from core.storage import (
     save_claim_payment, get_claim_payments, delete_claim_payment,
     save_investment_policy, get_investment_policies, save_investment_snapshot,
     get_investment_snapshots, get_investment_snapshot_funds, delete_investment_snapshot,
+    get_conn,
 )
 from core.categorize import categorize, apply_correction, is_office_for_category
 from core import reports
@@ -1259,6 +1260,62 @@ with tab_investments:
 
     policies = get_investment_policies()
     policy_options = {p["label"]: p["key"] for p in policies}
+
+    if policies:
+        with get_conn() as _conn:
+            with _conn.cursor() as _cur:
+                _cur.execute("""
+                    SELECT p.label, s.as_of_date, s.total_value
+                    FROM investment_value_snapshots s
+                    JOIN investment_policies p ON p.key = s.policy_key
+                    ORDER BY s.as_of_date
+                """)
+                _all_snaps = _cur.fetchall()
+
+        if _all_snaps:
+            hist_df = pd.DataFrame(_all_snaps, columns=["label", "as_of_date", "total_value"])
+            combined = hist_df.groupby("as_of_date", as_index=False)["total_value"].sum()
+            combined = combined.rename(columns={"total_value": "combined_total"})
+
+            st.markdown("### 📊 Portfolio overview")
+            latest_date = combined["as_of_date"].max()
+            latest_total = combined.loc[combined["as_of_date"] == latest_date, "combined_total"].iloc[0]
+            peak_row = combined.loc[combined["combined_total"].idxmax()]
+
+            mc1, mc2, mc3 = st.columns(3)
+            mc1.metric(f"Combined value (as of {latest_date})", f"₹{latest_total:,.2f}")
+            mc2.metric("All-time combined peak", f"₹{peak_row['combined_total']:,.2f}",
+                       help=f"Reached on {peak_row['as_of_date']}")
+            if len(combined) > 1:
+                prev_total = combined["combined_total"].iloc[-2]
+                mc3.metric("Change since prior check", f"₹{latest_total - prev_total:,.2f}",
+                           delta=f"{(latest_total - prev_total) / prev_total * 100:.2f}%")
+
+            st.plotly_chart(
+                px.line(combined, x="as_of_date", y="combined_total", markers=True,
+                        labels={"as_of_date": "Date", "combined_total": "Combined value (₹)"},
+                        title="Combined portfolio value over time"),
+                use_container_width=True,
+            )
+
+            st.markdown("#### Date-by-date comparison")
+            compare = combined.copy()
+            compare["change"] = compare["combined_total"].diff()
+            compare["change_pct"] = compare["combined_total"].pct_change() * 100
+            st.dataframe(compare.style.format({
+                "combined_total": "₹{:,.2f}", "change": "₹{:,.2f}", "change_pct": "{:+.2f}%",
+            }), use_container_width=True)
+
+            st.markdown("#### Highest value per policy, and when")
+            per_policy_peak = hist_df.loc[hist_df.groupby("label")["total_value"].idxmax()]
+            per_policy_peak = per_policy_peak.sort_values("total_value", ascending=False)
+            st.dataframe(
+                per_policy_peak.rename(columns={"label": "Policy", "as_of_date": "Date of peak",
+                                                 "total_value": "Peak value"})
+                               .style.format({"Peak value": "₹{:,.2f}"}),
+                use_container_width=True,
+            )
+        st.divider()
 
     with st.expander("➕ Add / update a policy", expanded=not policies):
         c1, c2, c3 = st.columns(3)
