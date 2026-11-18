@@ -199,15 +199,41 @@ def _find_header_row(raw: pd.DataFrame) -> int:
 def parse_ledger(xls_bytes: bytes) -> pd.DataFrame:
     """Returns a cleaned ledger DataFrame with columns:
     Date (datetime64), Type (str, stripped), Description, Debit (float),
-    Credit (float), RunningBalance (float, signed CR positive)."""
+    Credit (float), RunningBalance (float, signed CR positive).
+
+    Handles both Dhan ledger layouts seen in practice: the older export with
+    an explicit `Type` column, and the newer one with
+    Date / Transaction ID / Narration / Voucher Descriptions / Debit / Credit
+    (where Narration holds "Trades Executed")."""
     raw = pd.read_excel(io.BytesIO(xls_bytes), header=None)
     header_row = _find_header_row(raw)
     df = pd.read_excel(io.BytesIO(xls_bytes), header=header_row)
     df.columns = [str(c).strip() for c in df.columns]
     df = df.dropna(subset=["Date"]).copy()
-    df["Date"] = pd.to_datetime(df["Date"].astype(str).str.strip(), format="%d-%b-%Y", errors="coerce")
+
+    if "Type" not in df.columns:
+        for candidate in ("Narration", "Voucher Descriptions"):
+            if candidate in df.columns:
+                df["Type"] = df[candidate]
+                break
+    if "Description" not in df.columns:
+        for candidate in ("Voucher Descriptions", "Narration"):
+            if candidate in df.columns:
+                df["Description"] = df[candidate]
+                break
+    if "Description" not in df.columns:
+        df["Description"] = ""
+
+    df["Date"] = pd.to_datetime(df["Date"].astype(str).str.strip(), errors="coerce", dayfirst=True)
     df["Type"] = df["Type"].astype(str).str.strip()
-    df["Debit"] = pd.to_numeric(df["Debit"], errors="coerce").fillna(0.0)
-    df["Credit"] = pd.to_numeric(df["Credit"], errors="coerce").fillna(0.0)
+    for col in ("Debit", "Credit"):
+        df[col] = pd.to_numeric(
+            df[col].astype(str).str.replace(",", "", regex=False), errors="coerce"
+        ).fillna(0.0)
+    # Newer Dhan exports store debits as negative numbers (credit column
+    # stays positive). Normalise to the traditional positive-debit form so
+    # ledger_match_table's Credit - Debit convention works for both layouts.
+    if (df["Debit"] < 0).any():
+        df["Debit"] = df["Debit"].abs()
     df = df.dropna(subset=["Date"])
     return df.reset_index(drop=True)
