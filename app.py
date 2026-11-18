@@ -3,6 +3,7 @@ import io
 import re
 import uuid
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -377,10 +378,10 @@ def _deploy_info():
 st.caption(_deploy_info())
 
 (tab_upload, tab_uploads_log, tab_notes, tab_review, tab_accounts, tab_parties, tab_claims, tab_reports,
- tab_trading, tab_recon, tab_dhan, tab_fivepaisa, tab_investments, tab_rules) = st.tabs(
+ tab_trading, tab_recon, tab_dhan, tab_fivepaisa, tab_investments, tab_rules, tab_archive_upload) = st.tabs(
     ["📥 Upload", "📁 Uploads", "🗂️ Note Coverage", "🏷️ Review & Categorize", "🏦 Accounts", "🎭 Parties",
      "🧾 Expense Claims", "📊 Reports", "📈 Trading", "🔗 Reconciliation", "🪙 Dhan Recon", "🏦 5paisa Recon", "💹 Investments",
-     "🎯 Expected & Cross-Check"]
+     "🎯 Expected & Cross-Check", "📦 Bulk Archive Upload"]
 )
 
 # ---------------------------------------------------------------- Upload ---
@@ -1898,3 +1899,75 @@ with tab_rules:
             delete_rule(match["id"])
             st.success(f"Deleted '{del_name}'.")
             st.rerun()
+
+# -------------------------------------------------- Bulk Archive Upload tab -
+with tab_archive_upload:
+    st.caption(
+        "Upload the entire local contract-note archive (Dhan + 5paisa) to Supabase Storage, "
+        "so the app can parse/reconcile them. Files already uploaded are skipped. "
+        "The Note Coverage tab shows what's on disk; this tab makes those files available in the cloud."
+    )
+
+    ROOT = Path(__file__).resolve().parent
+
+    if st.button("Scan local archive (dry-run)", key="archive_scan"):
+        import subprocess, sys
+        result = subprocess.run(
+            [sys.executable, "scripts/bulk_upload_archive.py", "--dry-run"],
+            capture_output=True, text=True, cwd=ROOT,
+        )
+        st.text(result.stdout)
+        if result.stderr:
+            st.error(result.stderr)
+
+    st.divider()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Upload Dhan contract notes", key="archive_upload_dhan"):
+            import subprocess, sys
+            with st.spinner("Uploading Dhan contract notes..."):
+                result = subprocess.run(
+                    [sys.executable, "scripts/bulk_upload_archive.py", "--broker", "Dhan"],
+                    capture_output=True, text=True, cwd=ROOT, timeout=1800,
+                )
+            st.text(result.stdout)
+            if result.stderr:
+                st.error(result.stderr)
+            if result.returncode == 0:
+                st.success("Dhan upload complete")
+                st.rerun()
+
+    with c2:
+        if st.button("Upload 5paisa contract notes", key="archive_upload_5paisa"):
+            import subprocess, sys
+            with st.spinner("Uploading 5paisa contract notes..."):
+                result = subprocess.run(
+                    [sys.executable, "scripts/bulk_upload_archive.py", "--broker", "5paisa"],
+                    capture_output=True, text=True, cwd=ROOT, timeout=1800,
+                )
+            st.text(result.stdout)
+            if result.stderr:
+                st.error(result.stderr)
+            if result.returncode == 0:
+                st.success("5paisa upload complete")
+                st.rerun()
+
+    st.divider()
+    st.markdown("### Uploaded batches (contract notes)")
+
+    batches = [b for b in get_upload_batches()
+               if b.get("source_type", "").startswith("contract_note_archive")]
+    if not batches:
+        st.info("No contract-note archive batches uploaded yet.")
+    else:
+        st.dataframe(
+            pd.DataFrame([{
+                "Date": b["uploaded_at"],
+                "Broker": b["source_type"].split(":")[-1],
+                "Label": b["source_file"],
+                "Storage folder": b["file_storage_path"],
+                "Batch ID": b["id"][:8],
+            } for b in batches]),
+            use_container_width=True, hide_index=True,
+        )
