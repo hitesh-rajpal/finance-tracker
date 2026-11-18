@@ -1910,6 +1910,89 @@ with tab_archive_upload:
 
     ROOT = Path(__file__).resolve().parent
 
+    # --- Helper for real-time upload process ---
+    def run_bulk_upload(brokers_to_upload=None):
+        from core.archive_utils import find_archive_files
+        from core.file_storage import upload_file, ensure_bucket
+        from core.storage import get_upload_batches, save_upload_batch
+        from config import note_archive
+        import uuid
+
+        storage_cfg = {
+            "url": st.secrets["supabase_storage"]["url"],
+            "service_role_key": st.secrets["supabase_storage"]["service_role_key"],
+        }
+        ensure_bucket(storage_cfg["url"], storage_cfg["service_role_key"])
+        
+        already = {b.get("file_storage_path") for b in get_upload_batches() 
+                   if b.get("file_storage_path") and b["file_storage_path"].startswith("contract_notes/")}
+
+        target_brokers = brokers_to_upload or list(note_archive.BROKERS)
+        all_files_to_upload = []
+        for b in target_brokers:
+            all_files_to_upload.extend(find_archive_files(b, str(ROOT)))
+
+        if not all_files_to_upload:
+            st.info("No contract notes found to upload.")
+            return
+
+        # Group by date for batching
+        from collections import defaultdict
+        by_date = defaultdict(list)
+        for f in all_files_to_upload:
+            by_date[f["date"]].append(f)
+
+        sorted_dates = sorted(by_date.keys())
+        total_files = len(all_files_to_upload)
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        uploaded_count = 0
+        failed_count = 0
+        
+        for idx, date_str in enumerate(sorted_dates):
+            day_files = by_date[date_str]
+            batch_path = f"contract_notes/{day_files[0]['broker']}/{date_str}/"
+            
+            to_upload_now = []
+            for f in day_files:
+                s_path = batch_path + f["filename"]
+                if s_path not in already:
+                    to_upload_now.append((f, s_path))
+            
+            if to_upload_now:
+                batch_id = uuid.uuid4().hex[:16]
+                uploaded_in_batch = []
+                for f, s_path in to_upload_now:
+                    status_text.text(f"Uploading {f['filename']}...")
+                    with open(f["local_path"], "rb") as pdf:
+                        ok, msg = upload_file(storage_cfg["url"], storage_cfg["service_role_key"], s_path, pdf.read(), "application/pdf")
+                    if ok:
+                        uploaded_in_batch.append(s_path)
+                    else:
+                        failed_count += 1
+                
+                if uploaded_in_batch:
+                    save_upload_batch({
+                        "id": batch_id,
+                        "source_file": f"{day_files[0]['broker']} contract notes {date_str}",
+                        "source_type": f"contract_note_archive:{day_files[0]['broker']}",
+                        "parsed_count": 0, "saved_count": 0, "skipped_count": 0,
+                        "file_storage_path": batch_path,
+                    })
+                uploaded_count += len(uploaded_in_batch)
+
+            # Update progress bar based on dates processed
+            progress = (idx + 1) / len(sorted_dates)
+            progress_bar.progress(progress)
+            status_text.text(f"Processed {date_str} ({idx+1}/{len(sorted_dates)} days)")
+
+        status_text.empty()
+        progress_bar.empty()
+        st.success(f"Upload complete. {uploaded_count} files uploaded, {failed_count} failed.")
+        st.rerun()
+
     if st.button("Scan local archive (dry-run)", key="archive_scan"):
         import subprocess, sys
         result = subprocess.run(
@@ -1925,48 +2008,13 @@ with tab_archive_upload:
     c1, c2 = st.columns(2)
     with c1:
         if st.button("Upload Dhan contract notes", key="archive_upload_dhan"):
-            import subprocess, sys
-            with st.spinner("Uploading Dhan contract notes..."):
-                result = subprocess.run(
-                    [sys.executable, "scripts/bulk_upload_archive.py", "--broker", "Dhan"],
-                    capture_output=True, text=True, cwd=ROOT, timeout=1800,
-                )
-            st.text(result.stdout)
-            if result.stderr:
-                st.error(result.stderr)
-            if result.returncode == 0:
-                st.success("Dhan upload complete")
-                st.rerun()
-
+            run_bulk_upload(["Dhan"])
     with c2:
         if st.button("Upload 5paisa contract notes", key="archive_upload_5paisa"):
-            import subprocess, sys
-            with st.spinner("Uploading 5paisa contract notes..."):
-                result = subprocess.run(
-                    [sys.executable, "scripts/bulk_upload_archive.py", "--broker", "5paisa"],
-                    capture_output=True, text=True, cwd=ROOT, timeout=1800,
-                )
-            st.text(result.stdout)
-            if result.stderr:
-                st.error(result.stderr)
-            if result.returncode == 0:
-                st.success("5paisa upload complete")
-                st.rerun()
+            run_bulk_upload(["5paisa"])
 
-    # Upload both brokers at once
     if st.button("Upload all contract notes (Dhan + 5paisa)", key="archive_upload_all"):
-        import subprocess, sys
-        with st.spinner("Uploading all contract notes..."):
-            result = subprocess.run(
-                [sys.executable, "scripts/bulk_upload_archive.py"],
-                capture_output=True, text=True, cwd=ROOT, timeout=3600,
-            )
-        st.text(result.stdout)
-        if result.stderr:
-            st.error(result.stderr)
-        if result.returncode == 0:
-            st.success("All uploads complete")
-            st.rerun()
+        run_bulk_upload()
 
     st.divider()
     st.markdown("### Uploaded batches (contract notes)")
