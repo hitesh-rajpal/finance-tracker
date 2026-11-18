@@ -90,3 +90,42 @@ step once real statements confirm the layouts are stable per bank).
 `config/categories.py` — `CATEGORY_RULES` is an ordered list of
 `(category_name, [keywords])`. `OFFICE_DEFAULT_CATEGORIES` decides which
 categories default to "Office" until you override a specific transaction.
+
+## Contract note archive coverage
+
+The broker PDF archives live on the PC (see `config/note_archive.py` for the
+default paths), so they're scanned locally and the result is stored in
+Supabase for the 🗂️ **Note Coverage** tab:
+
+```bash
+python scripts/note_coverage.py                 # scan both brokers
+python scripts/note_coverage.py --broker 5paisa # one broker
+python scripts/note_coverage.py --no-db         # local files only
+```
+
+Coverage is measured against the broker's own trade history, not a plain
+weekday calendar:
+
+- **missing** — the broker traded that date, but no contract note is on disk
+- **quiet** — a weekday with neither a note nor a trade (holiday/no position),
+  so not a gap
+- **pending** — known outstanding items that can't be listed by date from the
+  local files (e.g. older notes still in Gmail)
+
+Each run is kept as a separate `note_scan_runs` row, so progress is visible
+over time. The same report is written to
+`docs/contract_notes_status.md` and `data/note_coverage.json`.
+
+The 5paisa notes are password-protected; until their password is added (or
+passed with `--password`), the scan records them as present but marks the
+broker's PDFs as unreadable, which blocks parsing/import.
+
+To reconcile every downloaded Dhan note against the ledger in one go:
+
+```bash
+python scripts/dhan_bulk_recon.py
+```
+
+It writes `docs/dhan_recon_status.md` and `data/dhan_recon.json` with the
+day-total mismatches, BF/CF continuity breaks, and unmatched new/closed
+positions.

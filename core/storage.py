@@ -14,6 +14,7 @@ A small psycopg2 pool is kept across Streamlit reruns via st.cache_resource
 so we don't open a fresh connection on every script rerun.
 """
 import hashlib
+import json
 import uuid
 from contextlib import contextmanager
 
@@ -248,17 +249,82 @@ CREATE TABLE IF NOT EXISTS expense_claim_payments (
     note TEXT,
     created_at TIMESTAMP DEFAULT now()
 );
+
+-- One row per run of scripts/note_coverage.py, per broker. The local archive
+-- only exists on this PC, so the scan is run there and its findings are kept
+-- here for the deployed app (and for comparing one scan with the next).
+CREATE TABLE IF NOT EXISTS note_scan_runs (
+    id TEXT PRIMARY KEY,
+    scanned_at TIMESTAMP DEFAULT now(),
+    broker TEXT NOT NULL,
+    label TEXT,
+    archive_root TEXT,
+    range_start DATE,
+    range_end DATE,
+    note_count INTEGER,
+    note_days INTEGER,
+    commodity_count INTEGER,
+    sof_sos_count INTEGER,
+    duplicate_days INTEGER,
+    expected_trade_days INTEGER,
+    missing_trade_days INTEGER,
+    quiet_weekdays INTEGER,
+    pre_range_trade_days INTEGER,
+    readable BOOLEAN,
+    pending_notes TEXT[],
+    trade_source TEXT[],
+    report JSONB
+);
+CREATE INDEX IF NOT EXISTS note_scan_runs_broker_idx ON note_scan_runs (broker, scanned_at DESC);
+
+-- The date-by-date outcome of a scan. status is:
+--   'present' — a note file is on disk
+--   'missing' — the broker traded that day but no note is on disk
+--   'quiet'   — a weekday with neither a note nor a trade (holiday/no position)
+CREATE TABLE IF NOT EXISTS note_scan_days (
+    run_id TEXT NOT NULL,
+    broker TEXT NOT NULL,
+    note_date DATE NOT NULL,
+    status TEXT NOT NULL,
+    traded BOOLEAN DEFAULT FALSE,
+    kinds TEXT[],
+    file_count INTEGER DEFAULT 0,
+    PRIMARY KEY (run_id, broker, note_date)
+);
+CREATE INDEX IF NOT EXISTS note_scan_days_run_idx ON note_scan_days (run_id, broker);
 """
+
+
+def _db_settings() -> dict:
+    """Supabase connection settings, from Streamlit secrets when running
+    inside the app, or straight from .streamlit/secrets.toml when run from a
+    script (scripts/note_coverage.py) outside the Streamlit runtime."""
+    try:
+        db = st.secrets["supabase"]
+        return {
+            "host": db["host"], "port": db["port"], "dbname": db["dbname"],
+            "user": db["user"], "password": db["password"],
+        }
+    except Exception:
+        import tomllib
+        from pathlib import Path
+
+        secrets_path = Path(__file__).resolve().parent.parent / ".streamlit" / "secrets.toml"
+        if not secrets_path.exists():
+            raise RuntimeError(
+                "No Supabase settings found: set [supabase] in .streamlit/secrets.toml"
+            )
+        with secrets_path.open("rb") as f:
+            db = tomllib.load(f)["supabase"]
+        return {
+            "host": db["host"], "port": db["port"], "dbname": db["dbname"],
+            "user": db["user"], "password": db["password"],
+        }
 
 
 @st.cache_resource
 def _pool() -> SimpleConnectionPool:
-    db = st.secrets["supabase"]
-    return SimpleConnectionPool(
-        1, 5,
-        host=db["host"], port=db["port"], dbname=db["dbname"],
-        user=db["user"], password=db["password"],
-    )
+    return SimpleConnectionPool(1, 5, **_db_settings())
 
 
 @contextmanager
@@ -807,3 +873,89 @@ def delete_claim_payment(payment_id: str):
                 (payment_id,),
             )
             cur.execute("DELETE FROM expense_claim_payments WHERE id = %s", (payment_id,))
+
+
+# --------------------------------------------------- contract-note coverage ---
+
+NOTE_RUN_FIELDS = [
+    "scanned_at", "broker", "label", "archive_root", "range_start", "range_end",
+    "note_count", "note_days", "commodity_count", "sof_sos_count",
+    "duplicate_days", "expected_trade_days", "missing_trade_days",
+    "quiet_weekdays", "pre_range_trade_days", "readable",
+    "pending_notes", "trade_source",
+]
+
+
+def save_note_scan(report: dict) -> str:
+    """Stores one broker's scan (summary + every date) and returns its id."""
+    run_id = uuid.uuid4().hex[:16]
+    row = {k: report.get(k) for k in NOTE_RUN_FIELDS}
+    row["id"] = run_id
+    row["pending_notes"] = report.get("pending_notes") or []
+    row["trade_source"] = report.get("trade_source") or []
+    row["report"] = psycopg2.extras.Json(
+        json.loads(json.dumps({k: v for k, v in report.items() if k != "days"}, default=str))
+    )
+    columns = ", ".join(row)
+    values = ", ".join(f"%({k})s" for k in row)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO note_scan_runs ({columns}) VALUES ({values})",
+                row,
+            )
+            days = report.get("days") or []
+            if days:
+                psycopg2.extras.execute_values(
+                    cur,
+                    """INSERT INTO note_scan_days
+                       (run_id, broker, note_date, status, traded, kinds, file_count)
+                       VALUES %s""",
+                    [
+                        (
+                            run_id, report["broker"], d["note_date"], d["status"],
+                            d["traded"], d.get("kinds") or [], d.get("file_count") or 0,
+                        )
+                        for d in days
+                    ],
+                )
+    return run_id
+
+
+def get_latest_note_scans() -> list[dict]:
+    """The most recent scan per broker (what the app's coverage tab shows)."""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT DISTINCT ON (broker) *
+                   FROM note_scan_runs
+                   ORDER BY broker, scanned_at DESC, id DESC"""
+            )
+            return cur.fetchall()
+
+
+def get_note_scan_days(run_id: str, status: str | None = None) -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if status:
+                cur.execute(
+                    "SELECT * FROM note_scan_days WHERE run_id = %s AND status = %s "
+                    "ORDER BY note_date",
+                    (run_id, status),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM note_scan_days WHERE run_id = %s ORDER BY note_date",
+                    (run_id,),
+                )
+            return cur.fetchall()
+
+
+def get_note_scan_runs(limit: int = 20) -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM note_scan_runs ORDER BY scanned_at DESC, id DESC LIMIT %s",
+                (limit,),
+            )
+            return cur.fetchall()

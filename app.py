@@ -20,6 +20,7 @@ from core.storage import (
     save_claim_payment, get_claim_payments, delete_claim_payment,
     save_investment_policy, get_investment_policies, save_investment_snapshot,
     get_investment_snapshots, get_investment_snapshot_funds, delete_investment_snapshot,
+    get_latest_note_scans, get_note_scan_days, get_note_scan_runs,
     get_conn,
 )
 from core.categorize import categorize, apply_correction, is_office_for_category
@@ -359,10 +360,11 @@ if storage_cfg() and not st.session_state.get("_bucket_ensured"):
 st.title("Office Expenses, Bank & Trading Tracker")
 st.caption("Data is stored in your private Supabase project — accessible only with the app password.")
 
-(tab_upload, tab_uploads_log, tab_review, tab_accounts, tab_parties, tab_claims, tab_reports,
+(tab_upload, tab_uploads_log, tab_notes, tab_review, tab_accounts, tab_parties, tab_claims, tab_reports,
  tab_trading, tab_recon, tab_dhan, tab_investments, tab_rules) = st.tabs(
-    ["📥 Upload", "📁 Uploads", "🏷️ Review & Categorize", "🏦 Accounts", "🎭 Parties", "🧾 Expense Claims",
-     "📊 Reports", "📈 Trading", "🔗 Reconciliation", "🪙 Dhan Recon", "💹 Investments", "🎯 Expected & Cross-Check"]
+    ["📥 Upload", "📁 Uploads", "🗂️ Note Coverage", "🏷️ Review & Categorize", "🏦 Accounts", "🎭 Parties",
+     "🧾 Expense Claims", "📊 Reports", "📈 Trading", "🔗 Reconciliation", "🪙 Dhan Recon", "💹 Investments",
+     "🎯 Expected & Cross-Check"]
 )
 
 # ---------------------------------------------------------------- Upload ---
@@ -655,6 +657,147 @@ with tab_uploads_log:
                     delete_upload_batch(b["id"], b["source_file"])
                     st.success("Batch, its transactions, and its stored file (if any) were deleted.")
                     st.rerun()
+
+# ---------------------------------------------------- Note Coverage tab ----
+with tab_notes:
+    st.subheader("Contract note archive — coverage")
+    st.caption(
+        "The scanned copy of each broker's archive is kept in Supabase, so this tab works "
+        "on the deployed app even though the PDFs themselves are only on the PC. "
+        "Re-run the scanner after downloading more notes; every run is kept."
+    )
+    scans = get_latest_note_scans()
+    if not scans:
+        st.info("No scan recorded yet. On the PC that holds the archive, run:")
+        st.code("python scripts/note_coverage.py", language="bash")
+    else:
+        for scan in scans:
+            st.markdown(f"### {scan.get('label') or scan['broker']}")
+            rng = (
+                f"{scan['range_start']} → {scan['range_end']}"
+                if scan.get("range_start") else "no notes found"
+            )
+            st.caption(f"Downloaded range: **{rng}** · last scanned {scan['scanned_at']:%Y-%m-%d %H:%M}"
+                       if hasattr(scan["scanned_at"], "strftime")
+                       else f"Downloaded range: **{rng}** · last scanned {scan['scanned_at']}")
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric(
+                "Contract notes on disk",
+                f"{scan.get('note_count') or 0}",
+                help=f"{scan.get('note_days') or 0} distinct dates"
+                     + (f"; {scan['commodity_count']} commodity note(s)" if scan.get("commodity_count") else "")
+                     + (f"; {scan['sof_sos_count']} SOF/SOS statement(s)" if scan.get("sof_sos_count") else ""),
+            )
+            c2.metric("Distinct note dates", f"{scan.get('note_days') or 0}")
+            c3.metric("Trade days in range", f"{scan.get('expected_trade_days') or 0}")
+            c4.metric("Missing (traded, no note)", f"{scan.get('missing_trade_days') or 0}",
+                      delta="clear" if not scan.get("missing_trade_days") else "needs attention",
+                      delta_color="normal" if not scan.get("missing_trade_days") else "inverse")
+            if scan.get("quiet_weekdays"):
+                st.caption(
+                    f"{scan['quiet_weekdays']} quiet weekday(s) have no note and no trade "
+                    "(holiday or no position) — not counted as missing."
+                )
+
+            readable = scan.get("readable")
+            if readable is False:
+                st.error("PDFs are password-protected and no saved password opens them. "
+                         "Parsing/importing is blocked until the correct password is added.")
+            elif readable is True:
+                st.success("PDF password check: opens with a saved password.")
+            else:
+                st.caption("PDF password check: not run (no password supplied).")
+
+            if scan.get("pending_notes"):
+                st.markdown("**Pending**")
+                for note in scan["pending_notes"]:
+                    st.markdown(f"- {note}")
+
+            if scan.get("pre_range_trade_days"):
+                st.caption(
+                    f"{scan['pre_range_trade_days']} traded date(s) sit before the earliest "
+                    "downloaded note — those older notes are the pending items above."
+                )
+
+            missing = get_note_scan_days(scan["id"], "missing")
+            if missing:
+                st.markdown("#### Missing dates — traded, but no note on disk")
+                st.dataframe(
+                    pd.DataFrame([{
+                        "Date": m["note_date"],
+                        "Status": "MISSING",
+                        "Traded": m["traded"],
+                    } for m in missing]),
+                    use_container_width=True, hide_index=True,
+                )
+            else:
+                st.success("No traded date in the downloaded range is missing a note.")
+
+            report = scan.get("report") or {}
+            dups = report.get("duplicate_dates") if isinstance(report, dict) else None
+            if dups:
+                with st.expander(f"⚠️ {len(dups)} date(s) with more than one file"):
+                    st.dataframe(
+                        pd.DataFrame([{
+                            "Date": d["date"],
+                            "Files": ", ".join(f"{k} ×{n}" for k, n in d["counts"].items()),
+                        } for d in dups]),
+                        use_container_width=True, hide_index=True,
+                    )
+
+            quiet = get_note_scan_days(scan["id"], "quiet")
+            if quiet:
+                with st.expander(f"{len(quiet)} quiet weekday(s) — no note and no trade"):
+                    st.caption("Holidays or days with no open position. These are not gaps — "
+                               "there was nothing to issue a contract note for.")
+                    st.dataframe(
+                        pd.DataFrame([{"Date": q["note_date"]} for q in quiet]),
+                        use_container_width=True, hide_index=True,
+                    )
+
+            with st.expander("All dates in this scan"):
+                all_days = get_note_scan_days(scan["id"])
+                all_df = pd.DataFrame([{
+                    "Date": d["note_date"],
+                    "Status": d["status"],
+                    "Traded": d["traded"],
+                    "Kinds": ", ".join(d.get("kinds") or []),
+                    "Files": d.get("file_count") or 0,
+                } for d in all_days])
+                status_filter = st.multiselect(
+                    "Status", ["present", "missing", "quiet"], default=["present", "missing", "quiet"],
+                    key=f"note_status_{scan['id']}",
+                )
+                st.dataframe(all_df[all_df["Status"].isin(status_filter)],
+                             use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Download this scan (CSV)",
+                    all_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"note_coverage_{scan['broker']}_{scan['id']}.csv",
+                    key=f"dl_note_{scan['id']}",
+                )
+
+            st.caption(f"Archive root scanned: `{scan.get('archive_root') or '—'}`")
+            st.divider()
+
+        st.markdown("#### Scan history")
+        runs = get_note_scan_runs(30)
+        st.dataframe(
+            pd.DataFrame([{
+                "Scanned": r["scanned_at"],
+                "Broker": r["broker"],
+                "Range": f"{r['range_start']} → {r['range_end']}" if r.get("range_start") else "—",
+                "Notes": r.get("note_count"),
+                "Trade days": r.get("expected_trade_days"),
+                "Missing": r.get("missing_trade_days"),
+                "Quiet": r.get("quiet_weekdays"),
+                "Password": "opens" if r.get("readable") else ("blocked" if r.get("readable") is False else "—"),
+            } for r in runs]),
+            use_container_width=True, hide_index=True,
+        )
+        st.caption("To refresh after downloading more notes, run on the archive PC:")
+        st.code("python scripts/note_coverage.py", language="bash")
 
 # --------------------------------------------------------- Review tab -----
 with tab_review:
