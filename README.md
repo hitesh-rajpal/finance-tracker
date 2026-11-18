@@ -129,3 +129,15 @@ python scripts/dhan_bulk_recon.py
 It writes `docs/dhan_recon_status.md` and `data/dhan_recon.json` with the
 day-total mismatches, BF/CF continuity breaks, and unmatched new/closed
 positions.
+
+The 5paisa archive has the same end-to-end check:
+
+```bash
+python scripts/fivepaisa_bulk_recon.py
+```
+
+It sums a day's F&O/equity note and any separate commodity note before
+comparing with the ledger's `Bill - FNO` / `Bill - Cash` /
+`Bill - Commodities` rows, chains B/F opening prices to the previous note
+day's closing rate, and reports `data/fivepaisa_recon.json` plus
+`docs/fivepaisa_recon_status.md`.
