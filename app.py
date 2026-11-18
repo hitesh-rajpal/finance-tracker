@@ -377,9 +377,9 @@ def _deploy_info():
 st.caption(_deploy_info())
 
 (tab_upload, tab_uploads_log, tab_notes, tab_review, tab_accounts, tab_parties, tab_claims, tab_reports,
- tab_trading, tab_recon, tab_dhan, tab_investments, tab_rules) = st.tabs(
+ tab_trading, tab_recon, tab_dhan, tab_fivepaisa, tab_investments, tab_rules) = st.tabs(
     ["📥 Upload", "📁 Uploads", "🗂️ Note Coverage", "🏷️ Review & Categorize", "🏦 Accounts", "🎭 Parties",
-     "🧾 Expense Claims", "📊 Reports", "📈 Trading", "🔗 Reconciliation", "🪙 Dhan Recon", "💹 Investments",
+     "🧾 Expense Claims", "📊 Reports", "📈 Trading", "🔗 Reconciliation", "🪙 Dhan Recon", "🏦 5paisa Recon", "💹 Investments",
      "🎯 Expected & Cross-Check"]
 )
 
@@ -1408,6 +1408,120 @@ with tab_dhan:
             else:
                 st.error(f"{len(unmatched)} closed position(s) with NO matching order found:")
                 st.dataframe(unmatched, use_container_width=True)
+            with st.expander("Show all closed positions"):
+                st.dataframe(cpt, use_container_width=True)
+
+# ---------------------------------------------------- 5paisa Recon tab ---
+with tab_fivepaisa:
+    st.caption(
+        "Upload a batch of 5paisa contract note PDFs + the 5paisa ledger statement (xlsx). "
+        "Checks every day's contract note total (equity/F&O + commodity summed) against the "
+        "ledger's Bill-FNO/Bill-Cash/Bill-Commodities rows, and chains B/F opening prices to "
+        "the prior note day's closing price. A sign anomaly means the note's Net Amount line "
+        "disagrees with its own Payin/Payout Obligation line (which matches the ledger)."
+    )
+
+    fp_pw_saved = get_pdf_passwords()
+    c1, c2 = st.columns(2)
+    with c1:
+        fp_cn_files = st.file_uploader(
+            "Contract note PDFs (select all at once — includes CommodityContract_*.pdf)",
+            type=["pdf"], accept_multiple_files=True, key="fp_cn_files",
+        )
+    with c2:
+        fp_ledger_file = st.file_uploader("Ledger statement (.xlsx)", type=["xlsx"], key="fp_ledger_file")
+
+    pw_options = ["-- type a new password --"] + [p["label"] for p in fp_pw_saved]
+    pw_choice = st.selectbox("Contract note password", pw_options, key="fp_pw_choice")
+    if pw_choice != "-- type a new password --":
+        fp_password = next(p["password"] for p in fp_pw_saved if p["label"] == pw_choice)
+    else:
+        fp_password = st.text_input("Password (HUF PAN)", type="password", key="fp_pw_typed")
+        save_label = st.text_input("Save as label for next time (optional)", key="fp_pw_label")
+        if save_label and fp_password:
+            save_statement_profile(save_label, password=fp_password)
+
+    if st.button("Run reconciliation", key="fp_run") and fp_cn_files and fp_ledger_file and fp_password:
+        from parsers import fivepaisa_parser as fp_parser
+        from core import fivepaisa_reconcile as fp_recon
+        notes: dict[str, list[dict]] = {}
+        parse_errors = []
+        for f in fp_cn_files:
+            try:
+                note = fp_parser.parse_contract_note(f.getvalue(), password=fp_password)
+            except fp_parser.PasswordRequired:
+                parse_errors.append(f"{f.name}: wrong password")
+                continue
+            if not note["trade_date"]:
+                parse_errors.append(f"{f.name}: couldn't find a trade date — skipped")
+                continue
+            notes.setdefault(note["trade_date"], []).append(note)
+
+        if parse_errors:
+            st.warning("Some files had issues:\n" + "\n".join(f"- {e}" for e in parse_errors))
+
+        if notes:
+            ledger_df = fp_parser.parse_ledger(fp_ledger_file.getvalue())
+            ledger_table = fp_recon.ledger_match_table(notes, ledger_df)
+            continuity_table = fp_recon.bfcf_continuity_table(notes)
+            closed_position_table = fp_recon.closed_position_table(notes)
+            summary = fp_recon.summarize(ledger_table, continuity_table, closed_position_table)
+
+            st.session_state["fp_results"] = {
+                "ledger_table": ledger_table, "continuity_table": continuity_table,
+                "closed_position_table": closed_position_table, "summary": summary,
+            }
+
+    results = st.session_state.get("fp_results")
+    if results:
+        s = results["summary"]
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Days checked", s["days_checked"])
+        m2.metric("Ledger mismatches", s["ledger_mismatches"], delta=f"+{s['sign_anomalies']} sign anomalies"
+                   if s["sign_anomalies"] else None)
+        m3.metric("B/F continuity links", s["continuity_links_checked"])
+        m4.metric("B/F breaks", s["continuity_breaks"])
+        m5, m6 = st.columns(2)
+        m5.metric("Closed positions", s["closed_positions"], delta=f"-{s['closed_positions_unmatched']} unmatched"
+                   if s["closed_positions_unmatched"] else None)
+        m6.metric("Expired", s["closed_positions_expired"])
+
+        st.markdown("### Contract note vs ledger, day by day")
+        lt = results["ledger_table"]
+        st.dataframe(
+            lt.style.map(lambda v: "background-color:#4caf5033" if v == "OK"
+                         else ("background-color:#ff980033" if v == "SIGN ANOMALY"
+                               else "background-color:#f4433633" if v == "MISMATCH" else ""),
+                         subset=["status"]),
+            use_container_width=True,
+        )
+
+        st.markdown("### B/F price continuity")
+        ct = results["continuity_table"]
+        if ct.empty:
+            st.info("No continuing F&O positions found to check (or only one trading day uploaded).")
+        else:
+            breaks = ct[ct["status"] != "OK"]
+            if breaks.empty:
+                st.success(f"All {len(ct)} B/F links match exactly — no dividend adjustments or errors detected.")
+            else:
+                st.error(f"{len(breaks)} break(s) found — check against an actual corporate-action announcement "
+                         "before assuming it's an error:")
+                st.dataframe(breaks, use_container_width=True)
+            with st.expander("Show all links checked"):
+                st.dataframe(ct, use_container_width=True)
+
+        st.markdown("### Closed F&O positions — explained by a trade or expiry?")
+        cpt = results["closed_position_table"]
+        if cpt.empty:
+            st.info("No carried F&O positions closed in this batch.")
+        else:
+            unexplained = cpt[cpt["status"] == "NO CLOSING TRADE FOUND"]
+            if unexplained.empty:
+                st.success(f"All {len(cpt)} closed position(s) explained (trade or expiry).")
+            else:
+                st.error(f"{len(unexplained)} position(s) with NO closing trade and NO expiry found:")
+                st.dataframe(unexplained, use_container_width=True)
             with st.expander("Show all closed positions"):
                 st.dataframe(cpt, use_container_width=True)
 
