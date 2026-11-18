@@ -360,6 +360,22 @@ if storage_cfg() and not st.session_state.get("_bucket_ensured"):
 st.title("Office Expenses, Bank & Trading Tracker")
 st.caption("Data is stored in your private Supabase project — accessible only with the app password.")
 
+# Show when this version was deployed (git commit + local build time)
+import subprocess, os, datetime
+def _deploy_info():
+    try:
+        root = os.path.dirname(os.path.abspath(__file__))
+        sha = subprocess.run(["git", "-C", root, "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=3).stdout.strip()
+        when = subprocess.run(["git", "-C", root, "log", "-1", "--format=%ci", sha],
+                              capture_output=True, text=True, timeout=3).stdout.strip()
+        if sha and when:
+            return f"v{sha} · {when}"
+    except Exception:
+        pass
+    return f"built {datetime.datetime.now():%Y-%m-%d %H:%M}"
+st.caption(_deploy_info())
+
 (tab_upload, tab_uploads_log, tab_notes, tab_review, tab_accounts, tab_parties, tab_claims, tab_reports,
  tab_trading, tab_recon, tab_dhan, tab_investments, tab_rules) = st.tabs(
     ["📥 Upload", "📁 Uploads", "🗂️ Note Coverage", "🏷️ Review & Categorize", "🏦 Accounts", "🎭 Parties",
@@ -1417,13 +1433,29 @@ with tab_investments:
 
         if _all_snaps:
             hist_df = pd.DataFrame(_all_snaps, columns=["label", "as_of_date", "total_value"])
-            combined = hist_df.groupby("as_of_date", as_index=False)["total_value"].sum()
-            combined = combined.rename(columns={"total_value": "combined_total"})
+            hist_df["total_value"] = hist_df["total_value"].astype(float)
+
+            # A policy only gets a new value when you record a snapshot, so a
+            # date where just one or two policies were updated must not make
+            # the others disappear from the total. Carry each policy's latest
+            # value forward, then sum — so the line shows the whole portfolio
+            # as of each date, not just whatever was entered that day.
+            wide = hist_df.pivot_table(
+                index="as_of_date", columns="label", values="total_value", aggfunc="sum",
+            ).sort_index()
+            filled = wide.ffill()
+            updated_counts = hist_df.groupby("as_of_date")["label"].nunique()
+            combined = filled.sum(axis=1).rename("combined_total").reset_index()
+            combined["policies_updated"] = (
+                combined["as_of_date"].map(updated_counts).fillna(0).astype(int)
+            )
+            combined["policies_total"] = filled.notna().sum(axis=1).values
 
             st.markdown("### 📊 Portfolio overview")
             latest_date = combined["as_of_date"].max()
             latest_total = combined.loc[combined["as_of_date"] == latest_date, "combined_total"].iloc[0]
             peak_row = combined.loc[combined["combined_total"].idxmax()]
+            latest_row = combined.iloc[-1]
 
             mc1, mc2, mc3 = st.columns(3)
             mc1.metric(f"Combined value (as of {latest_date})", f"₹{latest_total:,.2f}")
@@ -1432,7 +1464,14 @@ with tab_investments:
             if len(combined) > 1:
                 prev_total = combined["combined_total"].iloc[-2]
                 mc3.metric("Change since prior check", f"₹{latest_total - prev_total:,.2f}",
-                           delta=f"{(latest_total - prev_total) / prev_total * 100:.2f}%")
+                           delta=f"{(latest_total - prev_total) / prev_total * 100:.2f}%",
+                           help="Includes any policy added since the previous check.")
+
+            st.caption(
+                f"Each policy keeps its most recent recorded value until a new snapshot replaces it. "
+                f"On {latest_date}, {latest_row['policies_updated']} of "
+                f"{latest_row['policies_total']} policies were updated; the rest are carried forward."
+            )
 
             st.plotly_chart(
                 px.line(combined, x="as_of_date", y="combined_total", markers=True,
@@ -1448,6 +1487,26 @@ with tab_investments:
             st.dataframe(compare.style.format({
                 "combined_total": "₹{:,.2f}", "change": "₹{:,.2f}", "change_pct": "{:+.2f}%",
             }), use_container_width=True)
+            st.caption("`policies_updated` is how many policies got a fresh snapshot that date; "
+                       "the rest carried their previous value into the total.")
+
+            st.markdown("#### Latest value per policy")
+            latest_per_policy = (
+                hist_df.sort_values("as_of_date").groupby("label").tail(1)
+                .sort_values("total_value", ascending=False)
+            )
+            st.dataframe(
+                latest_per_policy.rename(columns={
+                    "label": "Policy", "as_of_date": "As of", "total_value": "Value",
+                }).style.format({"Value": "₹{:,.2f}"}),
+                use_container_width=True,
+            )
+            stale = latest_per_policy[latest_per_policy["as_of_date"] < latest_date]
+            if len(stale):
+                st.caption(
+                    "Not updated on the latest date (carried forward): "
+                    + ", ".join(stale["label"].tolist())
+                )
 
             st.markdown("#### Highest value per policy, and when")
             per_policy_peak = hist_df.loc[hist_df.groupby("label")["total_value"].idxmax()]
