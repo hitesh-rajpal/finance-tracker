@@ -1953,6 +1953,21 @@ with tab_archive_upload:
                 st.success("5paisa upload complete")
                 st.rerun()
 
+    # Upload both brokers at once
+    if st.button("Upload all contract notes (Dhan + 5paisa)", key="archive_upload_all"):
+        import subprocess, sys
+        with st.spinner("Uploading all contract notes..."):
+            result = subprocess.run(
+                [sys.executable, "scripts/bulk_upload_archive.py"],
+                capture_output=True, text=True, cwd=ROOT, timeout=3600,
+            )
+        st.text(result.stdout)
+        if result.stderr:
+            st.error(result.stderr)
+        if result.returncode == 0:
+            st.success("All uploads complete")
+            st.rerun()
+
     st.divider()
     st.markdown("### Uploaded batches (contract notes)")
 
