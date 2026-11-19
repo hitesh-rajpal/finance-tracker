@@ -378,9 +378,10 @@ def _deploy_info():
 st.caption(_deploy_info())
 
 (tab_upload, tab_uploads_log, tab_notes, tab_review, tab_accounts, tab_parties, tab_claims, tab_reports,
- tab_trading, tab_recon, tab_dhan, tab_fivepaisa, tab_investments, tab_rules, tab_archive_upload) = st.tabs(
+ tab_trading, tab_recon, tab_dhan, tab_fivepaisa, tab_fund_flow, tab_investments, tab_rules, tab_archive_upload) = st.tabs(
     ["📥 Upload", "📁 Uploads", "🗂️ Note Coverage", "🏷️ Review & Categorize", "🏦 Accounts", "🎭 Parties",
-     "🧾 Expense Claims", "📊 Reports", "📈 Trading", "🔗 Reconciliation", "🪙 Dhan Recon", "🏦 5paisa Recon", "💹 Investments",
+     "🧾 Expense Claims", "📊 Reports", "📈 Trading", "🔗 Reconciliation", "🪙 Dhan Recon", "🏦 5paisa Recon",
+     "💸 Fund Flow Recon", "💹 Investments",
      "🎯 Expected & Cross-Check", "📦 Bulk Archive Upload"]
 )
 
@@ -1525,6 +1526,161 @@ with tab_fivepaisa:
                 st.dataframe(unexplained, use_container_width=True)
             with st.expander("Show all closed positions"):
                 st.dataframe(cpt, use_container_width=True)
+
+# ------------------------------------------------------ Fund Flow Recon ---
+with tab_fund_flow:
+    st.caption(
+        "Cross-check money movement between the 5paisa ledger, your IndusInd HUF bank "
+        "statement and the CAS mutual-fund transactions. First upload the IndusInd "
+        "statement in the 📥 Upload tab (so its rows are in the app database), then "
+        "upload the 5paisa ledger and CAS PDF here."
+    )
+    from core import fund_flow as ff
+    from parsers.cas_parser import parse_cas_transactions
+    from parsers import fivepaisa_parser as fp
+
+    c1, c2 = st.columns(2)
+    with c1:
+        ff_ledger = st.file_uploader("5paisa ledger (.xlsx)", type=["xlsx"], key="ff_ledger")
+    with c2:
+        ff_cas = st.file_uploader("CAS PDF (CDSL/NSDL)", type=["pdf"], key="ff_cas")
+        ff_cas_pw = st.text_input("CAS password (HUF PAN)", type="password", key="ff_cas_pw")
+
+    # Bank rows come from the transactions table (source='statement'), so the
+    # same password/column-mapping flow already used in the Upload tab applies.
+    txns = fetch_all()
+    bank_df = pd.DataFrame([dict(r) for r in txns if r.get("source") == "statement"])
+    if bank_df.empty:
+        st.warning("No bank-statement transactions in the app database yet. "
+                   "Upload the IndusInd HUF PDF in the 📥 Upload tab first.")
+    else:
+        st.success(f"{len(bank_df)} bank-statement transaction(s) loaded from the database.")
+        with st.expander("Latest bank rows"):
+            st.dataframe(
+                bank_df[["date", "amount", "direction", "description", "account"]].tail(20),
+                use_container_width=True, hide_index=True,
+            )
+
+    with st.expander("Or upload the IndusInd bank statement here"):
+        ff_bank = st.file_uploader("IndusInd HUF statement PDF", type=["pdf"], key="ff_bank")
+        if ff_bank:
+            ff_raw = ff_bank.getvalue()
+            ff_saved_pw = get_pdf_passwords()
+            df_bank = handle_password_protected_pdf(
+                ff_bank,
+                lambda pw: statement_parser.extract_raw_table(ff_raw, password=pw),
+                ff_saved_pw,
+            )
+            if df_bank is not None and not df_bank.empty:
+                st.caption(f"Extracted {len(df_bank)} row(s).")
+                st.dataframe(one_indexed(df_bank), use_container_width=True, height=260)
+                guess = statement_parser.guess_column_mapping(df_bank)
+                cols = ["-- none --"] + list(df_bank.columns)
+
+                def _idx(field):
+                    v = guess.get(field)
+                    return cols.index(v) if v in cols else 0
+
+                b1, b2, b3, b4 = st.columns(4)
+                b_date = b1.selectbox("Date column", cols, index=_idx("date"), key="ff_b_date")
+                b_desc = b2.selectbox("Description column", cols, index=_idx("description"), key="ff_b_desc")
+                b_debit = b3.selectbox("Debit column", cols, index=_idx("debit"), key="ff_b_debit")
+                b_credit = b4.selectbox("Credit column", cols, index=_idx("credit"), key="ff_b_credit")
+                b5, b6 = st.columns(2)
+                b_amount = b5.selectbox("...or single amount column", cols, index=_idx("amount"), key="ff_b_amount")
+                b_default = b6.selectbox("Unsigned amount means", ["debit", "credit"], key="ff_b_default")
+                if st.button("Use these bank rows for matching", key="ff_b_use"):
+                    mapping = {"date": b_date, "description": b_desc}
+                    if b_debit != "-- none --":
+                        mapping["debit"] = b_debit
+                    if b_credit != "-- none --":
+                        mapping["credit"] = b_credit
+                    if b_amount != "-- none --":
+                        mapping["amount"] = b_amount
+                    rows = statement_parser.normalize_table(
+                        df_bank, mapping, "IndusInd", "HUF XX6259", ff_bank.name,
+                        default_direction=b_default,
+                    )
+                    st.session_state["ff_bank_df"] = pd.DataFrame(rows)
+                    st.success(f"Using {len(rows)} bank row(s) from {ff_bank.name} for matching.")
+                    st.rerun()
+
+    bank_df = st.session_state.get("ff_bank_df", bank_df)
+
+    if st.button("Run fund flow reconciliation", key="ff_run"):
+        if not ff_ledger:
+            st.error("Upload the 5paisa ledger first.")
+        elif not ff_cas or not ff_cas_pw:
+            st.error("Upload the CAS PDF and enter its password.")
+        else:
+            ledger_df = fp.parse_ledger(ff_ledger.getvalue())
+            cas_df = parse_cas_transactions(ff_cas.getvalue(), password=ff_cas_pw)
+            fund_match = ff.match_fund_transfers_to_bank(ledger_df, bank_df)
+            bank_unmatched = ff.unmatched_bank_fivepaisa(bank_df, ledger_df)
+            cas_match = ff.match_bank_to_cas(bank_df, cas_df)
+            st.session_state["fund_flow_results"] = {
+                "fund_match": fund_match,
+                "bank_unmatched": bank_unmatched,
+                "cas_match": cas_match,
+                "cas_rows": cas_df,
+            }
+
+    ff_results = st.session_state.get("fund_flow_results")
+    if ff_results:
+        s = ff.summary(ff_results["fund_match"], ff_results["bank_unmatched"], ff_results["cas_match"])
+        m1, m2, m3 = st.columns(3)
+        m1.metric("5paisa transfers matched", f"{s['fund_transfers_matched']}/{s['fund_transfers']}")
+        m2.metric("Bank 5paisa rows without ledger", s["bank_5paisa_unmatched"])
+        m3.metric("Bank↔CAS matches", f"{s['cas_matched']}/{s['cas_rows']}")
+
+        st.markdown("### 5paisa Funds Added / Withdrawn ↔ Bank")
+        fm = ff_results["fund_match"]
+        if fm.empty:
+            st.info("No Funds Added / Withdrawn rows found in the ledger.")
+        else:
+            bad = fm[fm["status"] != "MATCHED"]
+            if bad.empty:
+                st.success(f"All {len(fm)} fund transfers matched a bank transaction.")
+            else:
+                st.error(f"{len(bad)} transfer(s) not matched exactly:")
+                st.dataframe(bad, use_container_width=True, hide_index=True)
+            with st.expander("Show all fund-transfer matches"):
+                st.dataframe(fm, use_container_width=True, hide_index=True)
+
+        st.markdown("### Bank rows that look like 5paisa but have no ledger entry")
+        bu = ff_results["bank_unmatched"]
+        if bu.empty:
+            st.success("None found.")
+        else:
+            st.dataframe(bu, use_container_width=True, hide_index=True)
+
+        st.markdown("### Bank (AMC-named) ↔ CAS unit transactions")
+        cm = ff_results["cas_match"]
+        if cm.empty:
+            st.info("No bank rows with a mutual-fund/AMC description were found.")
+        else:
+            bad_cm = cm[cm["status"] != "MATCHED"]
+            if bad_cm.empty:
+                st.success(f"All {len(cm)} AMC-named bank rows matched a CAS transaction.")
+            else:
+                st.warning(f"{len(bad_cm)} AMC-named bank row(s) without a nearby CAS transaction:")
+                st.dataframe(bad_cm, use_container_width=True, hide_index=True)
+            with st.expander("Show all Bank↔CAS matches"):
+                st.dataframe(cm, use_container_width=True, hide_index=True)
+            st.caption("CAS carries units, not rupee amounts, so this is a date/fund match, "
+                       "not an amount check.")
+
+        with st.expander("CAS transactions parsed"):
+            st.dataframe(ff_results["cas_rows"], use_container_width=True, hide_index=True)
+
+        fp_results = st.session_state.get("fp_results")
+        if fp_results:
+            st.markdown("### 5paisa contract-note checks (from the 5paisa Recon tab)")
+            fps = fp_results["summary"]
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Days checked", fps["days_checked"])
+            c2.metric("Ledger mismatches", fps["ledger_mismatches"])
+            c3.metric("B/F breaks", fps["continuity_breaks"])
 
 # --------------------------------------------------------- Investments ---
 with tab_investments:
