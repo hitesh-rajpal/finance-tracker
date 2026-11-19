@@ -1565,14 +1565,84 @@ with tab_fivepaisa:
         if cpt.empty:
             st.info("No carried F&O positions closed in this batch.")
         else:
+            # Categorize
+            closed_by_trade = cpt[cpt["status"].str.contains("matched to trade", na=False)]
+            expired = cpt[cpt["status"].str.contains("expired", na=False)]
             unexplained = cpt[cpt["status"] == "NO CLOSING TRADE FOUND"]
-            if unexplained.empty:
-                st.success(f"All {len(cpt)} closed position(s) explained (trade or expiry).")
-            else:
-                st.error(f"{len(unexplained)} position(s) with NO closing trade and NO expiry found:")
-                st.dataframe(unexplained, use_container_width=True)
-            with st.expander("Show all closed positions"):
-                st.dataframe(cpt, use_container_width=True)
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("✅ Closed by trade", len(closed_by_trade))
+            m2.metric("📅 Expired (auto square-off)", len(expired))
+            m3.metric("❓ Unexplained (no trade, no expiry)", len(unexplained), delta="investigate" if len(unexplained) else None)
+
+            # Tabs for each category
+            tab_trade, tab_expired, tab_unexplained, tab_all = st.tabs([
+                f"✅ Closed by Trade ({len(closed_by_trade)})",
+                f"📅 Expired ({len(expired)})",
+                f"❓ Unexplained ({len(unexplained)})",
+                f"All ({len(cpt)})",
+            ])
+
+            with tab_trade:
+                if closed_by_trade.empty:
+                    st.info("No positions closed by an explicit trade.")
+                else:
+                    st.caption("Positions that disappeared because a closing trade (SELL for long, BUY for short) appeared on the contract note.")
+                    st.dataframe(closed_by_trade, use_container_width=True, hide_index=True,
+                        column_config={
+                            "prev_date": "Carried From",
+                            "date": "Disappeared On",
+                            "contract": "Contract",
+                            "side": "Side",
+                            "qty": "Qty",
+                            "matched_trade": "Closing Trade",
+                            "status": "Status",
+                        })
+
+            with tab_expired:
+                if expired.empty:
+                    st.info("No positions expired (reached expiry date while still carried).")
+                else:
+                    st.caption("Positions that reached their expiry date while still carried (B/F). Auto square-off by exchange.")
+                    st.dataframe(expired, use_container_width=True, hide_index=True,
+                        column_config={
+                            "prev_date": "Carried From",
+                            "date": "Expiry Date",
+                            "contract": "Contract",
+                            "side": "Side",
+                            "qty": "Qty",
+                            "matched_trade": "Closing Trade",
+                            "status": "Status",
+                        })
+
+            with tab_unexplained:
+                if unexplained.empty:
+                    st.success("All closed positions are explained — no mysteries!")
+                else:
+                    st.error(f"{len(unexplained)} position(s) vanished without a closing trade on the note AND before expiry. "
+                             "Likely the closing trade's contract note wasn't downloaded/emailed.")
+                    st.dataframe(unexplained, use_container_width=True, hide_index=True,
+                        column_config={
+                            "prev_date": "Carried From",
+                            "date": "Disappeared On",
+                            "contract": "Contract",
+                            "side": "Side",
+                            "qty": "Qty",
+                            "matched_trade": "Closing Trade",
+                            "status": "Status",
+                        })
+
+            with tab_all:
+                st.dataframe(cpt, use_container_width=True, hide_index=True,
+                    column_config={
+                        "prev_date": "Carried From",
+                        "date": "Disappeared On",
+                        "contract": "Contract",
+                        "side": "Side",
+                        "qty": "Qty",
+                        "matched_trade": "Closing Trade",
+                        "status": "Status",
+                    })
 
         # ---- DAY-WISE P&L FROM TRADES ----
         st.divider()
