@@ -1574,6 +1574,124 @@ with tab_fivepaisa:
             with st.expander("Show all closed positions"):
                 st.dataframe(cpt, use_container_width=True)
 
+        # ---- DAY-WISE P&L FROM TRADES ----
+        st.divider()
+        st.markdown("### 📈 Day-wise P&L (from contract note trades)")
+        st.caption("Calculated from the Annexure trades in each contract note. "
+                   "BUY = negative cashflow, SELL = positive cashflow. "
+                   "Compare with note_net (settlement) and note_obligation (ledger-matching line).")
+
+        # Build day-wise P&L from notes in results (or re-parse if needed)
+        if "fp_notes_cache" not in st.session_state:
+            # Re-parse quickly for P&L
+            from parsers import fivepaisa_parser as fp_parser
+            notes_for_pl = {}
+            for f in fp_cn_files or []:
+                try:
+                    note = fp_parser.parse_contract_note(f.getvalue(), password=fp_password)
+                except fp_parser.PasswordRequired:
+                    continue
+                if note["trade_date"]:
+                    notes_for_pl.setdefault(note["trade_date"], []).append(note)
+            notes_for_pl = fp_recon.dedupe_notes(notes_for_pl)
+            st.session_state["fp_notes_cache"] = notes_for_pl
+        else:
+            notes_for_pl = st.session_state["fp_notes_cache"]
+
+        day_pl_rows = []
+        for d in sorted(notes_for_pl):
+            day_notes = notes_for_pl[d]
+            total_pl = 0.0
+            total_trades = 0
+            total_net = 0.0
+            total_obligation = 0.0
+            for n in day_notes:
+                total_net += n.get("net_amount") or 0.0
+                total_obligation += n.get("obligation") or 0.0
+                for t in n.get("trades") or []:
+                    total_trades += 1
+                    side = t.get("side", "")
+                    qty = t.get("quantity", 0)
+                    price = t.get("price", 0)
+                    if side == "BUY":
+                        total_pl -= qty * price
+                    elif side == "SELL":
+                        total_pl += qty * price
+            if total_trades > 0 or total_net != 0:
+                day_pl_rows.append({
+                    "date": d,
+                    "notes": len(day_notes),
+                    "trades": total_trades,
+                    "note_net": round(total_net, 2),
+                    "note_obligation": round(total_obligation, 2) if total_obligation else None,
+                    "trade_pl": round(total_pl, 2),
+                })
+
+        if day_pl_rows:
+            pl_df = pd.DataFrame(day_pl_rows)
+            pl_df["date"] = pd.to_datetime(pl_df["date"])
+            pl_df = pl_df.sort_values("date")
+
+            # Date filter
+            c1, c2 = st.columns(2)
+            min_d, max_d = pl_df["date"].min(), pl_df["date"].max()
+            d1 = c1.date_input("From", min_d, key="pl_from")
+            d2 = c2.date_input("To", max_d, key="pl_to")
+            mask = (pl_df["date"] >= pd.Timestamp(d1)) & (pl_df["date"] <= pd.Timestamp(d2))
+            view = pl_df[mask].copy()
+            view["date"] = view["date"].dt.strftime("%Y-%m-%d")
+
+            # Metrics
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Days in range", len(view))
+            m2.metric("Total Trade P&L", f"{view['trade_pl'].sum():,.2f}")
+            m3.metric("Total Note Net", f"{view['note_net'].sum():,.2f}")
+
+            # Color-code P&L
+            def pl_color(v):
+                if v > 0:
+                    return "color:green"
+                elif v < 0:
+                    return "color:red"
+                return ""
+
+            st.dataframe(
+                view.style.map(pl_color, subset=["trade_pl"])
+                         .map(lambda v: "color:red" if v is not None and v < 0 else ("color:green" if v is not None and v > 0 else ""), subset=["note_net"]),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "date": "Date",
+                    "notes": "Notes",
+                    "trades": "Trades",
+                    "note_net": st.column_config.NumberColumn("Note Net", format="%.2f"),
+                    "note_obligation": st.column_config.NumberColumn("Note Obligation", format="%.2f"),
+                    "trade_pl": st.column_config.NumberColumn("Trade P&L", format="%.2f"),
+                }
+            )
+
+            # Download button
+            csv = view.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "📥 Download day-wise P&L (CSV)",
+                csv,
+                file_name=f"5paisa_daywise_pl_{d1}_to_{d2}.csv",
+                mime="text/csv",
+            )
+        else:
+            st.info("No trades found in the uploaded notes to calculate P&L.")
+
+        # ---- MISSING CONTRACT NOTES (from note coverage) ----
+        st.divider()
+        st.markdown("### 📋 Missing / Pending Contract Notes")
+        st.caption("Based on the note coverage scan: trading days where 5paisa had activity but no note is on disk.")
+        # This would come from the note_coverage scan; for now show the known pending
+        from config import note_archive
+        pending = note_archive.KNOWN_PENDING.get("5paisa_huf", "")
+        if pending:
+            st.warning(f"⚠️ **Known pending:** {pending}")
+        else:
+            st.success("No known pending notes from coverage scan.")
+
 # ------------------------------------------------------ Fund Flow Recon ---
 with tab_fund_flow:
     st.caption(
