@@ -38,7 +38,9 @@ BROKERS = {
         "notes_glob": r"Email_Downloads\5paisa_HUF_52598262\Contract_Notes\**\*.pdf",
         "trades_glob": r"5paisa_HUF_52598262\Transactions\*.xlsx",
         "ledger_glob": r"5paisa_HUF_52598262\Ledger\*.xlsx",
+        "orders_glob": r"5paisa_HUF_52598262\Transactions\*.xlsx",
         "trades_format": "5paisa_xlsx",
+        "orders_format": "5paisa_orders",
         "note_prefixes": {
             "CommodityContract_": "commodity",
             "ContractNote_": "contract_note",
@@ -65,8 +67,8 @@ BROKERS = {
 # scan finds them.
 KNOWN_PENDING = {
     "5paisa_huf": (
-        "706 older contract notes (before 2025-03-04) are still in Gmail and "
-        "have not been downloaded yet."
+        "All trading days from 2024-01-23 have contract notes downloaded. "
+        "706 older notes (pre-2024) may still be in Gmail but are outside the scanned range."
     ),
     "5paisa_ind": (
         "Ledger file not yet downloaded for individual account (54069875). "
