@@ -1446,8 +1446,16 @@ with tab_dhan:
             else:
                 st.error(f"{len(unmatched)} closed position(s) with NO matching order found:")
                 st.dataframe(unmatched, use_container_width=True)
-            with st.expander("Show all closed positions"):
-                st.dataframe(cpt, use_container_width=True)
+                        with st.expander("Show all closed positions"):
+                # Pagination for all closed positions
+                cpt_page_size = 50
+                cpt_total = len(cpt)
+                cpt_n_pages = max(1, (cpt_total + cpt_page_size - 1) // cpt_page_size)
+                cpt_page = st.number_input("Closed positions page", 1, cpt_n_pages, 1, key="cpt_page") - 1
+                cpt_start = cpt_page * cpt_page_size
+                cpt_end = min(cpt_start + cpt_page_size, cpt_total)
+                st.caption(f"Showing {cpt_start+1}-{cpt_end} of {cpt_total} positions")
+                st.dataframe(cpt.iloc[cpt_start:cpt_end], use_container_width=True, height=400)
 
 # ---------------------------------------------------- 5paisa Recon tab ---
 with tab_fivepaisa:
@@ -1642,28 +1650,55 @@ with tab_fivepaisa:
 
         st.markdown("### Contract note vs ledger, day by day")
         lt = results["ledger_table"]
+                lt = results["ledger_table"]
+        # Pagination for performance
+        lt_page_size = 50
+        lt_total = len(lt)
+        lt_n_pages = (lt_total + lt_page_size - 1) // lt_page_size
+        lt_page = st.number_input("Ledger page", 1, max(1, lt_n_pages), 1, key="lt_page") - 1
+        lt_start = lt_page * lt_page_size
+        lt_end = min(lt_start + lt_page_size, lt_total)
+        lt_display = lt.iloc[lt_start:lt_end]
+        st.caption(f"Showing {lt_start+1}-{lt_end} of {lt_total} rows")
         st.dataframe(
-            lt.style.map(lambda v: "background-color:#4caf5033" if v == "OK"
-                         else ("background-color:#ff980033" if v == "SIGN ANOMALY"
-                               else "background-color:#f4433633" if v == "MISMATCH" else ""),
-                         subset=["status"]),
+            lt_display.style.map(lambda v: "background-color:#4caf5033" if v == "OK"
+                                 else ("background-color:#ff980033" if v == "SIGN ANOMALY"
+                                       else "background-color:#f4433633" if v == "MISMATCH" else ""),
+                                  subset=["status"]),
             use_container_width=True,
+            height=400,
         )
 
-        st.markdown("### B/F price continuity")
+                st.markdown("### B/F price continuity")
         ct = results["continuity_table"]
         if ct.empty:
             st.info("No continuing F&O positions found to check (or only one trading day uploaded).")
         else:
             breaks = ct[ct["status"] != "OK"]
             if breaks.empty:
-                st.success(f"All {len(ct)} B/F links match exactly — no dividend adjustments or errors detected.")
+                st.success(f"All {len(ct)} B/F links match exactly -- no dividend adjustments or errors detected.")
             else:
-                st.error(f"{len(breaks)} break(s) found — check against an actual corporate-action announcement "
+                st.error(f"{len(breaks)} break(s) found -- check against an actual corporate-action announcement "
                          "before assuming it's an error:")
-                st.dataframe(breaks, use_container_width=True)
+                # Pagination for breaks
+                b_page_size = 20
+                b_total = len(breaks)
+                b_n_pages = max(1, (b_total + b_page_size - 1) // b_page_size)
+                b_page = st.number_input("Breaks page", 1, b_n_pages, 1, key="b_page") - 1
+                b_start = b_page * b_page_size
+                b_end = min(b_start + b_page_size, b_total)
+                st.caption(f"Showing {b_start+1}-{b_end} of {b_total} breaks")
+                st.dataframe(breaks.iloc[b_start:b_end], use_container_width=True)
             with st.expander("Show all links checked"):
-                st.dataframe(ct, use_container_width=True)
+                # Pagination for all links
+                ct_page_size = 50
+                ct_total = len(ct)
+                ct_n_pages = max(1, (ct_total + ct_page_size - 1) // ct_page_size)
+                ct_page = st.number_input("All links page", 1, ct_n_pages, 1, key="ct_page") - 1
+                ct_start = ct_page * ct_page_size
+                ct_end = min(ct_start + ct_page_size, ct_total)
+                st.caption(f"Showing {ct_start+1}-{ct_end} of {ct_total} links")
+                st.dataframe(ct.iloc[ct_start:ct_end], use_container_width=True, height=400)
 
         st.markdown("### Closed F&O positions — explained by a trade or expiry?")
         cpt = results["closed_position_table"]
@@ -2035,11 +2070,163 @@ with tab_investments:
     policies = get_investment_policies()
     policy_options = {p["label"]: p["key"] for p in policies}
 
+    # ----- Date Range Filter for Portfolio Analysis -----
+    st.markdown("### 📅 Portfolio Analysis - Date Range Comparison")
+    with get_conn() as _conn:
+        with _conn.cursor() as _cur:
+            _cur.execute("""
+                SELECT s.id, p.label, s.as_of_date, s.total_value, s.source,
+                       f.fund_name, f.units, f.nav, f.value
+                FROM investment_value_snapshots s
+                JOIN investment_policies p ON p.key = s.policy_key
+                LEFT JOIN investment_snapshot_funds f ON f.snapshot_id = s.id
+                ORDER BY p.label, s.as_of_date, f.fund_name
+            """)
+            _all_snap_data = _cur.fetchall()
+            _cur.execute("SELECT * FROM investment_policies ORDER BY label")
+            _all_policies = _cur.fetchall()
+
+    if _all_snap_data:
+        hist_df = pd.DataFrame(_all_snap_data, columns=["id", "label", "as_of_date", "total_value", "source",
+                                                         "fund_name", "units", "nav", "value"])
+        hist_df["as_of_date"] = pd.to_datetime(hist_df["as_of_date"])
+        hist_df["total_value"] = hist_df["total_value"].astype(float)
+
+        # Date range selector
+        min_date = hist_df["as_of_date"].min().date()
+        max_date = hist_df["as_of_date"].max().date()
+        c1, c2 = st.columns(2)
+        start_date = c1.date_input("Start Date", min_date, min_value=min_date, max_value=max_date, key="inv_start_date")
+        end_date = c2.date_input("End Date", max_date, min_value=min_date, max_value=max_date, key="inv_end_date")
+
+        # Filter data by date range
+        mask = (hist_df["as_of_date"].dt.date >= start_date) & (hist_df["as_of_date"].dt.date <= end_date)
+        filtered_df = hist_df[mask].copy()
+
+        # ---- Date Range Comparison View ----
+        st.markdown("#### 📊 Date Range Comparison")
+        if len(filtered_df) > 0:
+            # Policy-wise comparison
+            policy_comparison = filtered_df.groupby("label").agg(
+                first_date=("as_of_date", "min"),
+                last_date=("as_of_date", "max"),
+                first_value=("total_value", "first"),
+                last_value=("total_value", "last"),
+                snapshots=("total_value", "count"),
+            ).reset_index()
+            policy_comparison["change"] = policy_comparison["last_value"] - policy_comparison["first_value"]
+            policy_comparison["change_pct"] = (
+                (policy_comparison["change"] / policy_comparison["first_value"]) * 100
+            ).round(2)
+
+            st.dataframe(
+                policy_comparison.style.format({
+                    "first_value": "₹{:,.2f}",
+                    "last_value": "₹{:,.2f}",
+                    "change": "₹{:,.2f}",
+                    "change_pct": "{:+.2f}%",
+                }).applymap(
+                    lambda v: "color: green" if isinstance(v, (int, float)) and v > 0 else 
+                             ("color: red" if isinstance(v, (int, float)) and v < 0 else ""),
+                        subset=["change", "change_pct"]
+                ),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "label": "Policy",
+                    "first_date": st.column_config.DateColumn("First Date"),
+                    "last_date": st.column_config.DateColumn("Last Date"),
+                    "first_value": "First Value",
+                    "last_value": "Last Value",
+                    "snapshots": "Snapshots",
+                    "change": "Change (₹)",
+                    "change_pct": "Change (%)",
+                }
+            )
+
+            # Combined portfolio comparison
+            st.markdown("#### 📈 Combined Portfolio Comparison")
+            wide = filtered_df.pivot_table(
+                index="as_of_date", columns="label", values="total_value", aggfunc="sum"
+            ).sort_index()
+            filled = wide.ffill()
+            combined = filled.sum(axis=1).rename("combined_total").reset_index()
+            combined.columns = ["Date", "Combined Value"]
+            combined["Change"] = combined["Combined Value"].diff()
+            combined["Change %"] = combined["Combined Value"].pct_change() * 100
+
+            st.line_chart(
+                combined.set_index("Date")["Combined Value"],
+                use_container_width=True,
+            )
+            st.dataframe(
+                combined.style.format({
+                    "Combined Value": "₹{:,.2f}",
+                    "Change": "₹{:,.2f}",
+                    "Change %": "{:+.2f}%",
+                }).applymap(
+                    lambda v: "color: green" if isinstance(v, (int, float)) and v > 0 else 
+                             ("color: red" if isinstance(v, (int, float)) and v < 0 else ""),
+                        subset=["Change", "Change %"]
+                ),
+                use_container_width=True, hide_index=True,
+            )
+
+            # Fund-level comparison
+            st.markdown("#### 💰 Fund-Level Comparison")
+            fund_comparison = filtered_df[filtered_df["fund_name"].notna()].groupby(
+                ["label", "fund_name"]
+            ).agg(
+                first_date=("as_of_date", "min"),
+                last_date=("as_of_date", "max"),
+                first_value=("value", "first"),
+                last_value=("value", "last"),
+                first_units=("units", "first"),
+                last_units=("units", "last"),
+                first_nav=("nav", "first"),
+                last_nav=("nav", "last"),
+            ).reset_index()
+            fund_comparison["value_change"] = fund_comparison["last_value"] - fund_comparison["first_value"]
+            fund_comparison["units_change"] = fund_comparison["last_units"] - fund_comparison["first_units"]
+            fund_comparison["nav_change"] = fund_comparison["last_nav"] - fund_comparison["first_nav"]
+
+            st.dataframe(
+                fund_comparison.style.format({
+                    "first_value": "₹{:,.2f}",
+                    "last_value": "₹{:,.2f}",
+                    "value_change": "₹{:,.2f}",
+                    "first_units": "{:,.4f}",
+                    "last_units": "{:,.4f}",
+                    "units_change": "{:+.4f}",
+                    "first_nav": "{:.4f}",
+                    "last_nav": "{:.4f}",
+                    "nav_change": "{:+.4f}",
+                }).applymap(
+                    lambda v: "color: green" if isinstance(v, (int, float)) and v > 0 else 
+                             ("color: red" if isinstance(v, (int, float)) and v < 0 else ""),
+                        subset=["value_change", "units_change", "nav_change"]
+                ),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "label": "Policy",
+                    "fund_name": "Fund",
+                    "first_date": st.column_config.DateColumn("First Date"),
+                    "last_date": st.column_config.DateColumn("Last Date"),
+                    "first_value": "First Value",
+                    "last_value": "Last Value",
+                    "value_change": "Value Change (₹)",
+                    "first_units": "First Units",
+                    "last_units": "Last Units",
+                    "units_change": "Units Change",
+                    "first_nav": "First NAV",
+                    "last_nav": "Last NAV",
+                    "nav_change": "NAV Change",
+                }
+            )
+
     # ----- Excel Export (all data, multi-sheet) -----
     if policies:
         with get_conn() as _conn:
             with _conn.cursor() as _cur:
-                # Get all snapshots with funds
                 _cur.execute("""
                     SELECT s.id, p.label, s.as_of_date, s.total_value, s.source,
                            f.fund_name, f.units, f.nav, f.value
@@ -2049,7 +2236,6 @@ with tab_investments:
                     ORDER BY p.label, s.as_of_date, f.fund_name
                 """)
                 _all_snap_data = _cur.fetchall()
-                # Get all policies
                 _cur.execute("SELECT * FROM investment_policies ORDER BY label")
                 _all_policies = _cur.fetchall()
 
@@ -2058,8 +2244,6 @@ with tab_investments:
             import openpyxl
             from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
             from openpyxl.utils import get_column_letter
-
-            wb = openpyxl.Workbook()
 
             # Style helpers
             header_font = Font(bold=True, color="FFFFFF")
