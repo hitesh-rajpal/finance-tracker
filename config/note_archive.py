@@ -33,11 +33,23 @@ BROKERS = {
         },
         "contract_kinds": {"contract_note"},
     },
-    "5paisa": {
+    "5paisa_huf": {
         "label": "5paisa — HUF (52598262)",
-        "notes_glob": r"Email_Downloads\5paisa_*\Contract_Notes\**\*.pdf",
-        "trades_glob": r"5paisa_*\Transactions\*.xlsx",
-        "ledger_glob": r"5paisa_*\Ledger\*.xlsx",
+        "notes_glob": r"Email_Downloads\5paisa_HUF_52598262\Contract_Notes\**\*.pdf",
+        "trades_glob": r"5paisa_HUF_52598262\Transactions\*.xlsx",
+        "ledger_glob": r"5paisa_HUF_52598262\Ledger\*.xlsx",
+        "trades_format": "5paisa_xlsx",
+        "note_prefixes": {
+            "CommodityContract_": "commodity",
+            "ContractNote_": "contract_note",
+        },
+        "contract_kinds": {"contract_note", "commodity"},
+    },
+    "5paisa_ind": {
+        "label": "5paisa — Individual (54069875)",
+        "notes_glob": r"Email_Downloads\5paisa_54069875\Contract_Notes\**\*.pdf",
+        "trades_glob": r"5paisa_54069875\Transactions\*.xlsx",
+        "ledger_glob": r"5paisa_54069875\Ledger\*.xlsx",
         "trades_format": "5paisa_xlsx",
         "note_prefixes": {
             "CommodityContract_": "commodity",
@@ -52,8 +64,12 @@ BROKERS = {
 # as a pending note against the broker until they're downloaded and a new
 # scan finds them.
 KNOWN_PENDING = {
-    "5paisa": (
+    "5paisa_huf": (
         "706 older contract notes (before 2025-03-04) are still in Gmail and "
         "have not been downloaded yet."
+    ),
+    "5paisa_ind": (
+        "Ledger file not yet downloaded for individual account (54069875). "
+        "Contract notes and fund/securities statements are available."
     ),
 }

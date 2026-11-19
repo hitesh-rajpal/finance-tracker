@@ -1459,6 +1459,9 @@ with tab_fivepaisa:
         "disagrees with its own Payin/Payout Obligation line (which matches the ledger)."
     )
 
+    # Two 5paisa accounts: HUF (52598262) and Individual (54069875)
+    fp_account = st.radio("5paisa account", ["HUF (52598262)", "Individual (54069875)"], key="fp_account", horizontal=True)
+
     fp_pw_saved = get_pdf_passwords()
     c1, c2 = st.columns(2)
     with c1:
@@ -1474,7 +1477,8 @@ with tab_fivepaisa:
     if pw_choice != "-- type a new password --":
         fp_password = next(p["password"] for p in fp_pw_saved if p["label"] == pw_choice)
     else:
-        fp_password = st.text_input("Password (HUF PAN)", type="password", key="fp_pw_typed")
+        pw_label = "HUF PAN (AAHHH2655H)" if fp_account.startswith("HUF") else "Individual PAN"
+        fp_password = st.text_input(f"Password ({pw_label})", type="password", key="fp_pw_typed")
         save_label = st.text_input("Save as label for next time (optional)", key="fp_pw_label")
         if save_label and fp_password:
             save_statement_profile(save_label, password=fp_password)
@@ -1578,6 +1582,9 @@ with tab_fund_flow:
         "statement in the 📥 Upload tab (so its rows are in the app database), then "
         "upload the 5paisa ledger and CAS PDF here."
     )
+
+    ff_account = st.radio("5paisa account", ["HUF (52598262)", "Individual (54069875)"], key="ff_account", horizontal=True)
+
     from core import fund_flow as ff
     from parsers.cas_parser import parse_cas_transactions
     from parsers import fivepaisa_parser as fp
@@ -1587,7 +1594,8 @@ with tab_fund_flow:
         ff_ledger = st.file_uploader("5paisa ledger (.xlsx)", type=["xlsx"], key="ff_ledger")
     with c2:
         ff_cas = st.file_uploader("CAS PDF (CDSL/NSDL)", type=["pdf"], key="ff_cas")
-        ff_cas_pw = st.text_input("CAS password (HUF PAN)", type="password", key="ff_cas_pw")
+        cas_pw_label = "HUF PAN (AAHHH2655H)" if ff_account.startswith("HUF") else "Individual PAN"
+        ff_cas_pw = st.text_input(f"CAS password ({cas_pw_label})", type="password", key="ff_cas_pw")
 
     # Bank rows come from the transactions table (source='statement'), so the
     # same password/column-mapping flow already used in the Upload tab applies.
@@ -1605,7 +1613,7 @@ with tab_fund_flow:
             )
 
     with st.expander("Or upload the IndusInd bank statement here"):
-        ff_bank = st.file_uploader("IndusInd HUF statement PDF", type=["pdf"], key="ff_bank")
+        ff_bank = st.file_uploader("IndusInd statement PDF", type=["pdf"], key="ff_bank")
         if ff_bank:
             ff_raw = ff_bank.getvalue()
             ff_saved_pw = get_pdf_passwords()

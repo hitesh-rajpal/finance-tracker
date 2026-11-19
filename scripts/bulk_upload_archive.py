@@ -33,7 +33,8 @@ from core.storage import (  # noqa: E402
 
 BROKER_FOLDER_MAP = {
     "Dhan": "contract_note",
-    "5paisa": "contract_note",
+    "5paisa_huf": "contract_note",
+    "5paisa_ind": "contract_note",
 }
 
 
