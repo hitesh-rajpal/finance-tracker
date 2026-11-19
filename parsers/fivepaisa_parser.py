@@ -24,7 +24,9 @@ import pdfplumber
 from parsers.statement_parser import PasswordRequired
 
 TRADE_DATE_RE = re.compile(r"TRADE DATE\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{4})")
-CONTRACT_NO_RE = re.compile(r"CONTRACT NOTE NO\.\s+([A-Z0-9]+)")
+# Require at least one digit: on blank BSE notes the next token is the column
+# header "BSE", which is not a contract number.
+CONTRACT_NO_RE = re.compile(r"CONTRACT NOTE NO\.\s+([A-Z]*\d[A-Z0-9]*)")
 NET_RE = re.compile(r"Net Amount (Receivable|Payable) by Client\s+(.*)")
 OBLIGATION_RE = re.compile(r"Payin Payout Obligation\s+(-?[\d,]+\.\d{2})")
 AMT_PAIR_RE = re.compile(r"([-\d,]+\.\d{2})\s*(Cr|Dr)")

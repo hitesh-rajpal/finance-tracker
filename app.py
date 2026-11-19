@@ -354,6 +354,42 @@ def handle_password_protected_pdf(f, extract_fn, saved_passwords):
     return None
 
 
+def extract_bank_table(raw_bytes: bytes, password: str | None = None):
+    """Generic statement extraction, with an IndusInd fallback.
+
+    IndusInd quarterly statements put a term-deposit table (and a merged
+    "Product Description" cell) before the transaction table, which makes the
+    generic header heuristic pick the wrong columns.  Detect that case and use
+    the IndusInd-specific parser instead.
+    """
+    from parsers import indusind_parser
+
+    df = None
+    try:
+        df = statement_parser.extract_raw_table(raw_bytes, password=password)
+        guess = statement_parser.guess_column_mapping(df)
+        if guess.get("date") and (guess.get("debit") or guess.get("credit") or guess.get("amount")):
+            return df
+        generic_error = None
+    except statement_parser.PasswordRequired:
+        raise  # wrong/missing password — the UI needs to ask for it
+    except Exception as exc:  # malformed table — try the stricter parser
+        generic_error = exc
+
+    try:
+        indus = indusind_parser.extract_raw_like(raw_bytes, password=password)
+        if not indus.empty:
+            return indus
+    except statement_parser.PasswordRequired:
+        raise
+    except Exception:
+        pass
+
+    if df is not None:
+        return df
+    raise generic_error  # type: ignore[misc]
+
+
 if storage_cfg() and not st.session_state.get("_bucket_ensured"):
     file_storage.ensure_bucket(storage_cfg()["url"], storage_cfg()["service_role_key"])
     st.session_state["_bucket_ensured"] = True
@@ -427,7 +463,7 @@ with tab_upload:
         with st.expander(f"📄 {f.name}", expanded=True):
             raw_bytes = f.getvalue()
             df = handle_password_protected_pdf(
-                f, lambda pw: statement_parser.extract_raw_table(raw_bytes, password=pw), saved_passwords
+                f, lambda pw: extract_bank_table(raw_bytes, password=pw), saved_passwords
             )
             if df is None:
                 continue
@@ -1463,6 +1499,13 @@ with tab_fivepaisa:
             st.warning("Some files had issues:\n" + "\n".join(f"- {e}" for e in parse_errors))
 
         if notes:
+            # The archive has a few `_alt_` downloads of the same note; counting
+            # both doubles that day's total and looks like a ledger mismatch.
+            before = sum(len(v) for v in notes.values())
+            notes = fp_recon.dedupe_notes(notes)
+            after = sum(len(v) for v in notes.values())
+            if after < before:
+                st.caption(f"Ignored {before - after} duplicate copy/copies of the same contract note.")
             ledger_df = fp_parser.parse_ledger(fp_ledger_file.getvalue())
             ledger_table = fp_recon.ledger_match_table(notes, ledger_df)
             continuity_table = fp_recon.bfcf_continuity_table(notes)
@@ -1568,7 +1611,7 @@ with tab_fund_flow:
             ff_saved_pw = get_pdf_passwords()
             df_bank = handle_password_protected_pdf(
                 ff_bank,
-                lambda pw: statement_parser.extract_raw_table(ff_raw, password=pw),
+                lambda pw: extract_bank_table(ff_raw, password=pw),
                 ff_saved_pw,
             )
             if df_bank is not None and not df_bank.empty:

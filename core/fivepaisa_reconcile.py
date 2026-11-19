@@ -46,8 +46,35 @@ def _note_daily_net(notes: list[dict]) -> float:
     return round(sum(n.get("net_amount") or 0.0 for n in notes), 2)
 
 
+def _note_signature(note: dict) -> tuple:
+    """Identity of a contract note.
+
+    Contract number alone is not enough: a few 5paisa BSE notes print a blank
+    note number, so both copies parse as "BSE".  Include the obligation and
+    the actual trades, which are identical for a duplicate download but differ
+    for genuinely separate equity + commodity notes on the same day.
+    """
+    trades = tuple(sorted(
+        (
+            str(t.get("trade_no") or ""),
+            str(t.get("side") or ""),
+            round(float(t.get("quantity") or 0.0), 4),
+            round(float(t.get("price") or 0.0), 4),
+        )
+        for t in note.get("trades") or []
+    ))
+    return (
+        note.get("contract_no"),
+        note.get("trade_date"),
+        round(float(note.get("net_amount") or 0.0), 2),
+        note.get("obligation"),
+        bool(note.get("is_commodity")),
+        trades,
+    )
+
+
 def dedupe_notes(notes: dict[str, list[dict]]) -> dict[str, list[dict]]:
-    """Drops byte-for-byte duplicate copies of the same note.
+    """Drops duplicate copies of the same note.
 
     The archive contains a couple of `_alt_` downloads of the same contract
     note; counting both would double that day's total and make an exact
@@ -58,7 +85,7 @@ def dedupe_notes(notes: dict[str, list[dict]]) -> dict[str, list[dict]]:
         seen = set()
         unique = []
         for note in day_notes:
-            key = (note.get("contract_no"), note.get("trade_date"), note.get("net_amount"))
+            key = _note_signature(note)
             if key in seen:
                 continue
             seen.add(key)

@@ -7,6 +7,7 @@ backend app doing its own file management, not a client needing per-user
 RLS-scoped access.
 """
 import requests
+from urllib.parse import quote
 
 TIMEOUT = 20
 BUCKET = "uploads"
@@ -31,10 +32,12 @@ def ensure_bucket(url: str, service_key: str):
 
 
 def upload_file(url: str, service_key: str, path: str, data: bytes, content_type: str) -> tuple[bool, str]:
+    # x-upsert makes re-uploading the same archive path safe (overwrite rather
+    # than a 409 Duplicate error).
     try:
         resp = requests.post(
-            f"{url}/storage/v1/object/{BUCKET}/{path}",
-            headers={**_headers(service_key), "Content-Type": content_type},
+            f"{url}/storage/v1/object/{BUCKET}/{quote(path, safe='/')}",
+            headers={**_headers(service_key), "Content-Type": content_type, "x-upsert": "true"},
             data=data,
             timeout=TIMEOUT,
         )
@@ -50,7 +53,7 @@ def delete_file(url: str, service_key: str, path: str) -> bool:
         return True
     try:
         resp = requests.delete(
-            f"{url}/storage/v1/object/{BUCKET}/{path}",
+            f"{url}/storage/v1/object/{BUCKET}/{quote(path, safe='/')}",
             headers=_headers(service_key),
             timeout=TIMEOUT,
         )
@@ -66,7 +69,7 @@ def signed_url(url: str, service_key: str, path: str, expires_in: int = 3600) ->
         return None
     try:
         resp = requests.post(
-            f"{url}/storage/v1/object/sign/{BUCKET}/{path}",
+            f"{url}/storage/v1/object/sign/{BUCKET}/{quote(path, safe='/')}",
             headers={**_headers(service_key), "Content-Type": "application/json"},
             json={"expiresIn": expires_in},
             timeout=TIMEOUT,
