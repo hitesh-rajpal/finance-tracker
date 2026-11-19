@@ -1462,16 +1462,10 @@ with tab_fivepaisa:
     # Two 5paisa accounts: HUF (52598262) and Individual (54069875)
     fp_account = st.radio("5paisa account", ["HUF (52598262)", "Individual (54069875)"], key="fp_account", horizontal=True)
 
-    fp_pw_saved = get_pdf_passwords()
-    c1, c2 = st.columns(2)
-    with c1:
-        fp_cn_files = st.file_uploader(
-            "Contract note PDFs (select all at once — includes CommodityContract_*.pdf)",
-            type=["pdf"], accept_multiple_files=True, key="fp_cn_files",
-        )
-    with c2:
-        fp_ledger_file = st.file_uploader("Ledger statement (.xlsx)", type=["xlsx"], key="fp_ledger_file")
+    # Choose input method
+    fp_mode = st.radio("Input method", ["Upload files", "Use archived files (Supabase)"], key="fp_mode", horizontal=True)
 
+    fp_pw_saved = get_pdf_passwords()
     pw_options = ["-- type a new password --"] + [p["label"] for p in fp_pw_saved]
     pw_choice = st.selectbox("Contract note password", pw_options, key="fp_pw_choice")
     if pw_choice != "-- type a new password --":
@@ -1483,43 +1477,149 @@ with tab_fivepaisa:
         if save_label and fp_password:
             save_statement_profile(save_label, password=fp_password)
 
-    if st.button("Run reconciliation", key="fp_run") and fp_cn_files and fp_ledger_file and fp_password:
-        from parsers import fivepaisa_parser as fp_parser
-        from core import fivepaisa_reconcile as fp_recon
-        notes: dict[str, list[dict]] = {}
-        parse_errors = []
-        for f in fp_cn_files:
-            try:
-                note = fp_parser.parse_contract_note(f.getvalue(), password=fp_password)
-            except fp_parser.PasswordRequired:
-                parse_errors.append(f"{f.name}: wrong password")
-                continue
-            if not note["trade_date"]:
-                parse_errors.append(f"{f.name}: couldn't find a trade date — skipped")
-                continue
-            notes.setdefault(note["trade_date"], []).append(note)
+    if fp_mode == "Upload files":
+        c1, c2 = st.columns(2)
+        with c1:
+            fp_cn_files = st.file_uploader(
+                "Contract note PDFs (select all at once — includes CommodityContract_*.pdf)",
+                type=["pdf"], accept_multiple_files=True, key="fp_cn_files",
+            )
+        with c2:
+            fp_ledger_file = st.file_uploader("Ledger statement (.xlsx)", type=["xlsx"], key="fp_ledger_file")
 
-        if parse_errors:
-            st.warning("Some files had issues:\n" + "\n".join(f"- {e}" for e in parse_errors))
+        run_disabled = not (fp_cn_files and fp_ledger_file and fp_password)
+        run_label = "Run reconciliation"
+    else:
+        # Use archived files
+        st.info("Using contract notes already uploaded to Supabase Storage. "
+                "The ledger file still needs to be uploaded (not archived yet).")
+        fp_ledger_file = st.file_uploader("Ledger statement (.xlsx)", type=["xlsx"], key="fp_ledger_file_archive")
+        
+        # Show what's available in archive
+        if storage_cfg():
+            from core.storage import get_upload_batches
+            batches = get_upload_batches()
+            archive_batches = [b for b in batches if b.get("source_type", "").startswith("contract_note_archive:")]
+            huf_count = sum(1 for b in archive_batches if "5paisa_huf" in b.get("source_type", "") or "5paisa" in b.get("source_file", "").lower())
+            ind_count = sum(1 for b in archive_batches if "5paisa_ind" in b.get("source_type", ""))
+            account_label = "5paisa_huf" if fp_account.startswith("HUF") else "5paisa_ind"
+            relevant = [b for b in archive_batches if account_label in b.get("source_type", "")]
+            st.caption(f"📦 Archive has **{len(relevant)} batch(es)** for {fp_account} (contract notes)")
+            with st.expander("Show archive batches"):
+                for b in relevant[:20]:
+                    st.write(f"- {b.get('source_file')} — {b.get('file_storage_path')} ({b.get('uploaded_at')})")
+        
+        run_disabled = not (fp_ledger_file and fp_password)
+        run_label = "Run reconciliation from archive"
 
-        if notes:
-            # The archive has a few `_alt_` downloads of the same note; counting
-            # both doubles that day's total and looks like a ledger mismatch.
-            before = sum(len(v) for v in notes.values())
-            notes = fp_recon.dedupe_notes(notes)
-            after = sum(len(v) for v in notes.values())
-            if after < before:
-                st.caption(f"Ignored {before - after} duplicate copy/copies of the same contract note.")
-            ledger_df = fp_parser.parse_ledger(fp_ledger_file.getvalue())
-            ledger_table = fp_recon.ledger_match_table(notes, ledger_df)
-            continuity_table = fp_recon.bfcf_continuity_table(notes)
-            closed_position_table = fp_recon.closed_position_table(notes)
-            summary = fp_recon.summarize(ledger_table, continuity_table, closed_position_table)
+    if st.button(run_label, key="fp_run", disabled=run_disabled) and fp_password:
+            from parsers import fivepaisa_parser as fp_parser
+            from core import fivepaisa_reconcile as fp_recon
+            notes: dict[str, list[dict]] = {}
+            parse_errors = []
 
-            st.session_state["fp_results"] = {
-                "ledger_table": ledger_table, "continuity_table": continuity_table,
-                "closed_position_table": closed_position_table, "summary": summary,
-            }
+            if fp_mode == "Upload files":
+                # Parse uploaded files
+                for f in fp_cn_files:
+                    try:
+                        note = fp_parser.parse_contract_note(f.getvalue(), password=fp_password)
+                    except fp_parser.PasswordRequired:
+                        parse_errors.append(f"{f.name}: wrong password")
+                        continue
+                    if not note["trade_date"]:
+                        parse_errors.append(f"{f.name}: couldn't find a trade date — skipped")
+                        continue
+                    notes.setdefault(note["trade_date"], []).append(note)
+            else:
+                # Download and parse from Supabase archive
+                if not storage_cfg():
+                    st.error("Supabase Storage not configured.")
+                    notes = {}
+                else:
+                    from core.storage import get_upload_batches
+                    from core import file_storage
+                    storage = storage_cfg()
+                    batches = get_upload_batches()
+                    account_label = "5paisa_huf" if fp_account.startswith("HUF") else "5paisa_ind"
+                    archive_batches = [
+                        b for b in batches 
+                        if b.get("source_type", "").startswith("contract_note_archive:") 
+                        and account_label in b.get("source_type", "")
+                    ]
+                    if not archive_batches:
+                        st.error(f"No archived contract notes found for {fp_account}.")
+                    else:
+                        progress = st.progress(0, text="Downloading & parsing archived notes...")
+                        total_files = 0
+                        for i, batch in enumerate(archive_batches):
+                            folder_path = b.get("file_storage_path", "")
+                            if not folder_path:
+                                continue
+                            # List files in this folder - we need to get all files under this prefix
+                            # For now, we'll use the fact that each batch represents one day's files
+                            # and the batch was uploaded with a folder path
+                            pass  # We'll implement file listing below
+                        
+                        # Actually, we need a different approach - list all files in the contract_notes/5paisa_huf/ prefix
+                        import requests
+                        from urllib.parse import quote
+                        
+                        def _headers(service_key):
+                            return {"Authorization": f"Bearer {service_key}", "apikey": service_key}
+                        
+                        prefix = f"contract_notes/{account_label}/"
+                        try:
+                            resp = requests.get(
+                                f"{storage['url']}/storage/v1/object/list/{file_storage.BUCKET}",
+                                headers={**_headers(storage['service_role_key']), "Content-Type": "application/json"},
+                                json={"prefix": prefix, "limit": 10000},
+                                timeout=30,
+                            )
+                            if resp.status_code == 200:
+                                files = resp.json()
+                                total_files = len(files)
+                                for idx, f in enumerate(files):
+                                    path = f.get("name", "")
+                                    if not path or not path.endswith(".pdf"):
+                                        continue
+                                    progress.progress((idx + 1) / total_files, text=f"Parsing {path} ({idx+1}/{total_files})")
+                                    data = file_storage.download_file(storage['url'], storage['service_role_key'], path)
+                                    if data:
+                                        try:
+                                            note = fp_parser.parse_contract_note(data, password=fp_password)
+                                            if note["trade_date"]:
+                                                notes.setdefault(note["trade_date"], []).append(note)
+                                        except fp_parser.PasswordRequired:
+                                            parse_errors.append(f"{path}: wrong password")
+                                        except Exception as e:
+                                            parse_errors.append(f"{path}: {type(e).__name__}")
+                            else:
+                                st.error(f"Failed to list archive files: {resp.text}")
+                        except Exception as e:
+                            st.error(f"Archive access error: {e}")
+                        progress.empty()
+
+                    if parse_errors:
+                        st.warning("Some files had issues:\n" + "\n".join(f"- {e}" for e in parse_errors[:20]))
+
+                    if notes:
+                        # The archive has a few `_alt_` downloads of the same note; counting
+                        # both doubles that day's total and looks like a ledger mismatch.
+                        before = sum(len(v) for v in notes.values())
+                        notes = fp_recon.dedupe_notes(notes)
+                        after = sum(len(v) for v in notes.values())
+                        if after < before:
+                            st.caption(f"Ignored {before - after} duplicate copy/copies of the same contract note.")
+                        ledger_df = fp_parser.parse_ledger(fp_ledger_file.getvalue())
+                        ledger_table = fp_recon.ledger_match_table(notes, ledger_df)
+                        continuity_table = fp_recon.bfcf_continuity_table(notes)
+                        closed_position_table = fp_recon.closed_position_table(notes)
+                        summary = fp_recon.summarize(ledger_table, continuity_table, closed_position_table)
+
+                        st.session_state["fp_results"] = {
+                            "ledger_table": ledger_table, "continuity_table": continuity_table,
+                            "closed_position_table": closed_position_table, "summary": summary,
+                        }
 
     results = st.session_state.get("fp_results")
     if results:

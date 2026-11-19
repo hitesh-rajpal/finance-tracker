@@ -80,3 +80,20 @@ def signed_url(url: str, service_key: str, path: str, expires_in: int = 3600) ->
         return None
     signed_path = resp.json().get("signedURL")
     return f"{url}/storage/v1{signed_path}" if signed_path else None
+
+
+def download_file(url: str, service_key: str, path: str) -> bytes | None:
+    """Download a file directly from Supabase Storage (private bucket)."""
+    if not path:
+        return None
+    try:
+        resp = requests.get(
+            f"{url}/storage/v1/object/{BUCKET}/{quote(path, safe='/')}",
+            headers=_headers(service_key),
+            timeout=TIMEOUT,
+        )
+    except requests.RequestException:
+        return None
+    if resp.status_code == 200:
+        return resp.content
+    return None
