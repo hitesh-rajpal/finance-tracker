@@ -1519,17 +1519,21 @@ with tab_fivepaisa:
             parse_errors = []
 
             if fp_mode == "Upload files":
-                # Parse uploaded files
+                # Parse uploaded files (use parse_contract_notes for multi-note PDFs)
                 for f in fp_cn_files:
                     try:
-                        note = fp_parser.parse_contract_note(f.getvalue(), password=fp_password)
+                        notes_list = fp_parser.parse_contract_notes(f.getvalue(), password=fp_password)
                     except fp_parser.PasswordRequired:
                         parse_errors.append(f"{f.name}: wrong password")
                         continue
-                    if not note["trade_date"]:
-                        parse_errors.append(f"{f.name}: couldn't find a trade date — skipped")
+                    if not notes_list:
+                        parse_errors.append(f"{f.name}: no contract notes found")
                         continue
-                    notes.setdefault(note["trade_date"], []).append(note)
+                    for note in notes_list:
+                        if not note["trade_date"]:
+                            parse_errors.append(f"{f.name}: couldn't find a trade date — skipped")
+                            continue
+                        notes.setdefault(note["trade_date"], []).append(note)
             else:
                 # Download and parse from Supabase archive
                 if not storage_cfg():
@@ -1586,9 +1590,10 @@ with tab_fivepaisa:
                                     data = file_storage.download_file(storage['url'], storage['service_role_key'], path)
                                     if data:
                                         try:
-                                            note = fp_parser.parse_contract_note(data, password=fp_password)
-                                            if note["trade_date"]:
-                                                notes.setdefault(note["trade_date"], []).append(note)
+                                            notes_list = fp_parser.parse_contract_notes(data, password=fp_password)
+                                            for note in notes_list:
+                                                if note["trade_date"]:
+                                                    notes.setdefault(note["trade_date"], []).append(note)
                                         except fp_parser.PasswordRequired:
                                             parse_errors.append(f"{path}: wrong password")
                                         except Exception as e:
@@ -2029,6 +2034,244 @@ with tab_investments:
 
     policies = get_investment_policies()
     policy_options = {p["label"]: p["key"] for p in policies}
+
+    # ----- Excel Export (all data, multi-sheet) -----
+    if policies:
+        with get_conn() as _conn:
+            with _conn.cursor() as _cur:
+                # Get all snapshots with funds
+                _cur.execute("""
+                    SELECT s.id, p.label, s.as_of_date, s.total_value, s.source,
+                           f.fund_name, f.units, f.nav, f.value
+                    FROM investment_value_snapshots s
+                    JOIN investment_policies p ON p.key = s.policy_key
+                    LEFT JOIN investment_snapshot_funds f ON f.snapshot_id = s.id
+                    ORDER BY p.label, s.as_of_date, f.fund_name
+                """)
+                _all_snap_data = _cur.fetchall()
+                # Get all policies
+                _cur.execute("SELECT * FROM investment_policies ORDER BY label")
+                _all_policies = _cur.fetchall()
+
+        if _all_snap_data:
+            import io
+            import openpyxl
+            from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+            from openpyxl.utils import get_column_letter
+
+            wb = openpyxl.Workbook()
+
+            # Style helpers
+            header_font = Font(bold=True, color="FFFFFF")
+            header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+            header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            thin_border = Border(
+                left=Side(style='thin'), right=Side(style='thin'),
+                top=Side(style='thin'), bottom=Side(style='thin')
+            )
+            currency_fmt = '#,##0.00'
+            pct_fmt = '0.00%'
+
+            def style_header(ws, row, max_col):
+                for col in range(1, max_col + 1):
+                    cell = ws.cell(row=row, column=col)
+                    cell.font = header_font
+                    cell.fill = header_fill
+                    cell.alignment = header_align
+                    cell.border = thin_border
+
+            def style_data(ws, start_row, end_row, max_col):
+                for r in range(start_row, end_row + 1):
+                    for c in range(1, max_col + 1):
+                        cell = ws.cell(row=r, column=c)
+                        cell.border = thin_border
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+            def auto_width(ws, min_width=10, max_width=40):
+                for col in ws.columns:
+                    max_len = 0
+                    col_letter = get_column_letter(col[0].column)
+                    for cell in col:
+                        try:
+                            if cell.value:
+                                max_len = max(max_len, len(str(cell.value)))
+                        except:
+                            pass
+                    ws.column_dimensions[col_letter].width = min(max(max_len + 2, min_width), max_width)
+
+            # ---- Sheet 1: Policies Master ----
+            ws1 = wb.active
+            ws1.title = "Policies Master"
+            headers1 = ["Key", "Label", "Insurer", "Policy No.", "Type", "Premium (₹)", "Frequency",
+                        "Next Premium Due", "Sum Assured (₹)", "Total Invested (₹)",
+                        "Premiums Paid", "Total Premiums", "Maturity Date",
+                        "Auto-debit Set Up", "Policy Holder", "Nominee"]
+            for c, h in enumerate(headers1, 1):
+                ws1.cell(row=1, column=c, value=h)
+            style_header(ws1, 1, len(headers1))
+            for r, p in enumerate(_all_policies, 2):
+                ws1.cell(row=r, column=1, value=p["key"])
+                ws1.cell(row=r, column=2, value=p["label"])
+                ws1.cell(row=r, column=3, value=p["insurer"])
+                ws1.cell(row=r, column=4, value=p["policy_no"])
+                ws1.cell(row=r, column=5, value=p["policy_type"])
+                ws1.cell(row=r, column=6, value=p["premium_amount"])
+                ws1.cell(row=r, column=7, value=p["premium_frequency"])
+                ws1.cell(row=r, column=8, value=p["next_premium_due"])
+                ws1.cell(row=r, column=9, value=p["sum_assured"])
+                ws1.cell(row=r, column=10, value=p["total_invested"])
+                ws1.cell(row=r, column=11, value=p["premiums_paid"])
+                ws1.cell(row=r, column=12, value=p["total_premiums"])
+                ws1.cell(row=r, column=13, value=p["maturity_date"])
+                auto_debit_map = {True: "Yes", False: "No", None: "Unknown"}
+                ws1.cell(row=r, column=14, value=auto_debit_map.get(p["auto_debit_set_up"]))
+                ws1.cell(row=r, column=15, value=p["policy_holder"])
+                ws1.cell(row=r, column=16, value=p["nominee"])
+            style_data(ws1, 2, len(_all_policies) + 1, len(headers1))
+            auto_width(ws1)
+
+            # ---- Sheet 2: All Snapshots (raw) ----
+            ws2 = wb.create_sheet("All Snapshots")
+            headers2 = ["Snapshot ID", "Policy", "As of Date", "Total Value (₹)", "Source",
+                        "Fund Name", "Units", "NAV", "Fund Value (₹)"]
+            for c, h in enumerate(headers2, 1):
+                ws2.cell(row=1, column=c, value=h)
+            style_header(ws2, 1, len(headers2))
+            for r, snap in enumerate(_all_snap_data, 2):
+                ws2.cell(row=r, column=1, value=snap["id"])
+                ws2.cell(row=r, column=2, value=snap["label"])
+                ws2.cell(row=r, column=3, value=snap["as_of_date"])
+                ws2.cell(row=r, column=4, value=snap["total_value"])
+                ws2.cell(row=r, column=5, value=snap["source"])
+                ws2.cell(row=r, column=6, value=snap["fund_name"])
+                ws2.cell(row=r, column=7, value=snap["units"])
+                ws2.cell(row=r, column=8, value=snap["nav"])
+                ws2.cell(row=r, column=9, value=snap["value"])
+            style_data(ws2, 2, len(_all_snap_data) + 1, len(headers2))
+            auto_width(ws2)
+
+            # ---- Sheet 3: Policy-wise History (combined per policy) ----
+            ws3 = wb.create_sheet("Policy History")
+            headers3 = ["Policy", "As of Date", "Total Value (₹)", "Source", "# Funds Updated"]
+            for c, h in enumerate(headers3, 1):
+                ws3.cell(row=1, column=c, value=h)
+            style_header(ws3, 1, len(headers3))
+            
+            # Build policy history from snapshots
+            policy_hist = {}
+            for snap in _all_snap_data:
+                label = snap["label"]
+                policy_hist.setdefault(label, []).append(snap)
+            
+            row = 2
+            for label in sorted(policy_hist):
+                snaps = policy_hist[label]
+                snaps.sort(key=lambda x: x["as_of_date"])
+                for s in snaps:
+                    # Count funds for this snapshot
+                    fund_count = sum(1 for x in _all_snap_data if x["id"] == s["id"] and x["fund_name"])
+                    ws3.cell(row=row, column=1, value=label)
+                    ws3.cell(row=row, column=2, value=s["as_of_date"])
+                    ws3.cell(row=row, column=3, value=s["total_value"])
+                    ws3.cell(row=row, column=4, value=s["source"])
+                    ws3.cell(row=row, column=5, value=fund_count)
+                    row += 1
+            style_data(ws3, 2, row - 1, len(headers3))
+            auto_width(ws3)
+
+            # ---- Sheet 4: Latest Fund Breakdown per Policy ----
+            ws4 = wb.create_sheet("Latest Fund Breakdown")
+            headers4 = ["Policy", "As of Date", "Fund Name", "Units", "NAV", "Value (₹)"]
+            for c, h in enumerate(headers4, 1):
+                ws4.cell(row=1, column=c, value=h)
+            style_header(ws4, 1, len(headers4))
+            row = 2
+            for label in sorted(policy_hist):
+                latest_snap = policy_hist[label][-1]  # most recent
+                latest_funds = [x for x in _all_snap_data if x["id"] == latest_snap["id"] and x["fund_name"]]
+                for f in latest_funds:
+                    ws4.cell(row=row, column=1, value=label)
+                    ws4.cell(row=row, column=2, value=latest_snap["as_of_date"])
+                    ws4.cell(row=row, column=3, value=f["fund_name"])
+                    ws4.cell(row=row, column=4, value=f["units"])
+                    ws4.cell(row=row, column=5, value=f["nav"])
+                    ws4.cell(row=row, column=6, value=f["value"])
+                    row += 1
+            style_data(ws4, 2, row - 1, len(headers4))
+            auto_width(ws4)
+
+            # ---- Sheet 5: Combined Portfolio Timeline ----
+            ws5 = wb.create_sheet("Combined Portfolio")
+            headers5 = ["As of Date", "Combined Total (₹)", "Policies Updated", "Policies Total", "Change (₹)", "Change %"]
+            for c, h in enumerate(headers5, 1):
+                ws5.cell(row=1, column=c, value=h)
+            style_header(ws5, 1, len(headers5))
+            
+            # Rebuild combined timeline
+            import pandas as pd
+            hist_df = pd.DataFrame(_all_snap_data, columns=["id", "label", "as_of_date", "total_value", "source",
+                                                             "fund_name", "units", "nav", "value"])
+            hist_df["as_of_date"] = pd.to_datetime(hist_df["as_of_date"])
+            hist_df["total_value"] = hist_df["total_value"].astype(float)
+            wide = hist_df.pivot_table(index="as_of_date", columns="label", values="total_value", aggfunc="sum").sort_index()
+            filled = wide.ffill()
+            updated_counts = hist_df.groupby("as_of_date")["label"].nunique()
+            combined = filled.sum(axis=1).rename("combined_total").reset_index()
+            combined["policies_updated"] = combined["as_of_date"].map(updated_counts).fillna(0).astype(int)
+            combined["policies_total"] = filled.notna().sum(axis=1).values
+            combined["change"] = combined["combined_total"].diff()
+            combined["change_pct"] = combined["combined_total"].pct_change()
+            
+            for r, (_, c_row) in enumerate(combined.iterrows(), 2):
+                ws5.cell(row=r, column=1, value=c_row["as_of_date"].strftime("%Y-%m-%d"))
+                ws5.cell(row=r, column=2, value=round(c_row["combined_total"], 2))
+                ws5.cell(row=r, column=3, value=int(c_row["policies_updated"]))
+                ws5.cell(row=r, column=4, value=int(c_row["policies_total"]))
+                ws5.cell(row=r, column=5, value=round(c_row["change"], 2) if pd.notna(c_row["change"]) else "")
+                ws5.cell(row=r, column=6, value=round(c_row["change_pct"], 4) if pd.notna(c_row["change_pct"]) else "")
+            style_data(ws5, 2, len(combined) + 1, len(headers5))
+            auto_width(ws5)
+
+            # ---- Sheet 6: Policy Gains (if total_invested tracked) ----
+            ws6 = wb.create_sheet("Policy Gains")
+            headers6 = ["Policy", "Total Invested (₹)", "Latest Value (₹)", "As of Date", "Gain (₹)", "Gain %"]
+            for c, h in enumerate(headers6, 1):
+                ws6.cell(row=1, column=c, value=h)
+            style_header(ws6, 1, len(headers6))
+            row = 2
+            for p in _all_policies:
+                if p["total_invested"]:
+                    # Find latest snapshot for this policy
+                    p_snaps = [x for x in _all_snap_data if x["label"] == p["label"]]
+                    if p_snaps:
+                        latest = max(p_snaps, key=lambda x: x["as_of_date"])
+                        gain = latest["total_value"] - p["total_invested"]
+                        gain_pct = gain / p["total_invested"]
+                        ws6.cell(row=row, column=1, value=p["label"])
+                        ws6.cell(row=row, column=2, value=p["total_invested"])
+                        ws6.cell(row=row, column=3, value=latest["total_value"])
+                        ws6.cell(row=row, column=4, value=latest["as_of_date"])
+                        ws6.cell(row=row, column=5, value=round(gain, 2))
+                        ws6.cell(row=row, column=6, value=round(gain_pct, 4))
+                        row += 1
+            style_data(ws6, 2, row - 1, len(headers6))
+            auto_width(ws6)
+
+            # Save to bytes
+            output = io.BytesIO()
+            wb.save(output)
+            output.seek(0)
+            xlsx_bytes = output.read()
+
+            # Download button
+            st.download_button(
+                label="📥 Export All Investment Data to Excel (6 sheets)",
+                data=xlsx_bytes,
+                file_name=f"investments_export_{date.today().isoformat()}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+            st.caption("Sheets: Policies Master | All Snapshots (raw) | Policy History | Latest Fund Breakdown | Combined Portfolio | Policy Gains")
 
     if policies:
         with get_conn() as _conn:

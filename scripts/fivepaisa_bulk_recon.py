@@ -72,7 +72,7 @@ def main() -> int:
     parser.add_argument("--password", action="append", default=[])
     args = parser.parse_args()
 
-    cfg = note_archive.BROKERS["5paisa"]
+    cfg = note_archive.BROKERS["5paisa_huf"]
     note_paths = _find(args.root, cfg["notes_glob"])
     ledger_paths = _find(args.root, cfg["ledger_glob"])
     if not note_paths:
@@ -93,20 +93,25 @@ def main() -> int:
     for path in note_paths:
         filename = os.path.basename(path)
         try:
-            note = fivepaisa_parser.parse_contract_note(Path(path).read_bytes(), password=password)
+            # Use parse_contract_notes to handle multi-note PDFs (Cash+F&O combined)
+            notes_list = fivepaisa_parser.parse_contract_notes(Path(path).read_bytes(), password=password)
         except Exception as exc:
             failures.append({"file": filename, "error": f"{type(exc).__name__}: {exc}"})
             continue
-        if not note["trade_date"]:
-            failures.append({"file": filename, "error": "no trade date found"})
+        if not notes_list:
+            failures.append({"file": filename, "error": "no contract notes found"})
             continue
-        m = DATE_RE.search(filename)
-        if m and m.group(1) != note["trade_date"]:
-            date_mismatches.append({
-                "file": filename, "filename_date": m.group(1), "note_date": note["trade_date"],
-            })
-        note["file"] = filename
-        notes.setdefault(note["trade_date"], []).append(note)
+        for note in notes_list:
+            if not note["trade_date"]:
+                failures.append({"file": filename, "error": "no trade date found"})
+                continue
+            m = DATE_RE.search(filename)
+            if m and m.group(1) != note["trade_date"]:
+                date_mismatches.append({
+                    "file": filename, "filename_date": m.group(1), "note_date": note["trade_date"],
+                })
+            note["file"] = filename
+            notes.setdefault(note["trade_date"], []).append(note)
 
     raw_note_count = sum(len(v) for v in notes.values())
     notes = recon.dedupe_notes(notes)
