@@ -2023,21 +2023,26 @@ with tab_investments:
     policies = get_investment_policies()
     policy_options = {p["label"]: p["key"] for p in policies}
 
-    # ----- Date Range Filter for Portfolio Analysis -----
-    st.markdown("### 📅 Portfolio Analysis - Date Range Comparison")
-    with get_conn() as _conn:
-        with _conn.cursor() as _cur:
-            _cur.execute("""
-                SELECT s.id, p.label, s.as_of_date, s.total_value, s.source,
-                       f.fund_name, f.units, f.nav, f.value
-                FROM investment_value_snapshots s
-                JOIN investment_policies p ON p.key = s.policy_key
-                LEFT JOIN investment_snapshot_funds f ON f.snapshot_id = s.id
-                ORDER BY p.label, s.as_of_date, f.fund_name
-            """)
-            _all_snap_data = _cur.fetchall()
-            _cur.execute("SELECT * FROM investment_policies ORDER BY label")
-            _all_policies = _cur.fetchall()
+    # ----- Cached data loading -----
+    @st.cache_data(ttl=300, show_spinner="Loading investment data...")
+    def load_investment_data():
+        with get_conn() as _conn:
+            with _conn.cursor() as _cur:
+                _cur.execute("""
+                    SELECT s.id, p.label, s.as_of_date, s.total_value, s.source,
+                           f.fund_name, f.units, f.nav, f.value
+                    FROM investment_value_snapshots s
+                    JOIN investment_policies p ON p.key = s.policy_key
+                    LEFT JOIN investment_snapshot_funds f ON f.snapshot_id = s.id
+                    ORDER BY p.label, s.as_of_date, f.fund_name
+                """)
+                snap_data = _cur.fetchall()
+                _cur.execute("SELECT * FROM investment_policies ORDER BY label")
+                pol_data = _cur.fetchall()
+        return snap_data, pol_data
+
+    # Load data (cached)
+    _all_snap_data, _all_policies = load_investment_data()
 
     if _all_snap_data:
         hist_df = pd.DataFrame(_all_snap_data, columns=["id", "label", "as_of_date", "total_value", "source",
@@ -2073,26 +2078,17 @@ with tab_investments:
             ).round(2)
 
             st.dataframe(
-                policy_comparison.style.format({
-                    "first_value": "₹{:,.2f}",
-                    "last_value": "₹{:,.2f}",
-                    "change": "₹{:,.2f}",
-                    "change_pct": "{:+.2f}%",
-                }).applymap(
-                    lambda v: "color: green" if isinstance(v, (int, float)) and v > 0 else 
-                             ("color: red" if isinstance(v, (int, float)) and v < 0 else ""),
-                        subset=["change", "change_pct"]
-                ),
+                policy_comparison,
                 use_container_width=True, hide_index=True,
                 column_config={
                     "label": "Policy",
                     "first_date": st.column_config.DateColumn("First Date"),
                     "last_date": st.column_config.DateColumn("Last Date"),
-                    "first_value": "First Value",
-                    "last_value": "Last Value",
+                    "first_value": st.column_config.NumberColumn("First Value", format="₹{:,.2f}"),
+                    "last_value": st.column_config.NumberColumn("Last Value", format="₹{:,.2f}"),
                     "snapshots": "Snapshots",
-                    "change": "Change (₹)",
-                    "change_pct": "Change (%)",
+                    "change": st.column_config.NumberColumn("Change (₹)", format="₹{:,.2f}"),
+                    "change_pct": st.column_config.NumberColumn("Change (%)", format="{:+.2f}%"),
                 }
             )
 
@@ -2112,16 +2108,14 @@ with tab_investments:
                 use_container_width=True,
             )
             st.dataframe(
-                combined.style.format({
-                    "Combined Value": "₹{:,.2f}",
-                    "Change": "₹{:,.2f}",
-                    "Change %": "{:+.2f}%",
-                }).applymap(
-                    lambda v: "color: green" if isinstance(v, (int, float)) and v > 0 else 
-                             ("color: red" if isinstance(v, (int, float)) and v < 0 else ""),
-                        subset=["Change", "Change %"]
-                ),
+                combined,
                 use_container_width=True, hide_index=True,
+                column_config={
+                    "Date": st.column_config.DateColumn("Date"),
+                    "Combined Value": st.column_config.NumberColumn("Combined Value", format="₹{:,.2f}"),
+                    "Change": st.column_config.NumberColumn("Change (₹)", format="₹{:,.2f}"),
+                    "Change %": st.column_config.NumberColumn("Change (%)", format="{:+.2f}%"),
+                }
             )
 
             # Fund-level comparison
@@ -2143,56 +2137,27 @@ with tab_investments:
             fund_comparison["nav_change"] = fund_comparison["last_nav"] - fund_comparison["first_nav"]
 
             st.dataframe(
-                fund_comparison.style.format({
-                    "first_value": "₹{:,.2f}",
-                    "last_value": "₹{:,.2f}",
-                    "value_change": "₹{:,.2f}",
-                    "first_units": "{:,.4f}",
-                    "last_units": "{:,.4f}",
-                    "units_change": "{:+.4f}",
-                    "first_nav": "{:.4f}",
-                    "last_nav": "{:.4f}",
-                    "nav_change": "{:+.4f}",
-                }).applymap(
-                    lambda v: "color: green" if isinstance(v, (int, float)) and v > 0 else 
-                             ("color: red" if isinstance(v, (int, float)) and v < 0 else ""),
-                        subset=["value_change", "units_change", "nav_change"]
-                ),
+                fund_comparison,
                 use_container_width=True, hide_index=True,
                 column_config={
                     "label": "Policy",
                     "fund_name": "Fund",
                     "first_date": st.column_config.DateColumn("First Date"),
                     "last_date": st.column_config.DateColumn("Last Date"),
-                    "first_value": "First Value",
-                    "last_value": "Last Value",
-                    "value_change": "Value Change (₹)",
-                    "first_units": "First Units",
-                    "last_units": "Last Units",
-                    "units_change": "Units Change",
-                    "first_nav": "First NAV",
-                    "last_nav": "Last NAV",
-                    "nav_change": "NAV Change",
+                    "first_value": st.column_config.NumberColumn("First Value", format="₹{:,.2f}"),
+                    "last_value": st.column_config.NumberColumn("Last Value", format="₹{:,.2f}"),
+                    "value_change": st.column_config.NumberColumn("Value Change (₹)", format="₹{:,.2f}"),
+                    "first_units": st.column_config.NumberColumn("First Units", format="{:,.4f}"),
+                    "last_units": st.column_config.NumberColumn("Last Units", format="{:,.4f}"),
+                    "units_change": st.column_config.NumberColumn("Units Change", format="{:+.4f}"),
+                    "first_nav": st.column_config.NumberColumn("First NAV", format="{:.4f}"),
+                    "last_nav": st.column_config.NumberColumn("Last NAV", format="{:.4f}"),
+                    "nav_change": st.column_config.NumberColumn("NAV Change", format="{:+.4f}"),
                 }
             )
 
     # ----- Excel Export (all data, multi-sheet) -----
-    if policies:
-        with get_conn() as _conn:
-            with _conn.cursor() as _cur:
-                _cur.execute("""
-                    SELECT s.id, p.label, s.as_of_date, s.total_value, s.source,
-                           f.fund_name, f.units, f.nav, f.value
-                    FROM investment_value_snapshots s
-                    JOIN investment_policies p ON p.key = s.policy_key
-                    LEFT JOIN investment_snapshot_funds f ON f.snapshot_id = s.id
-                    ORDER BY p.label, s.as_of_date, f.fund_name
-                """)
-                _all_snap_data = _cur.fetchall()
-                _cur.execute("SELECT * FROM investment_policies ORDER BY label")
-                _all_policies = _cur.fetchall()
-
-        if _all_snap_data:
+    if policies and _all_snap_data:
             import io
             import openpyxl
             from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
