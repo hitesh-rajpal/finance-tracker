@@ -30,6 +30,7 @@ from core import financial_rules as fr
 from core import auth
 from core import file_storage
 from parsers import sms_parser, statement_parser, contract_note_parser, dhan_parser
+from parsers.dhan_parser import parse_dhan_trades, parse_dhan_ledger
 from core import dhan_reconcile
 
 try:
@@ -1322,140 +1323,93 @@ with tab_recon:
 # ------------------------------------------------------- Dhan Recon tab ---
 with tab_dhan:
     st.caption(
-        "Upload a batch of Dhan contract note PDFs + the Dhan ledger statement (xls). "
-        "Checks every day's contract note total against the ledger, and checks every "
-        "F&O position's carried-forward price against the next day's opening price — "
-        "a break in that chain usually means a dividend adjustment (NSE adjusts F&O "
-        "contracts for dividends at or above 2% of market value) or a genuine broker error."
+        "Dhan reconciliation: Trade History (CSV) + Ledger (Excel) — matches daily trade P&L to ledger, "
+        "tracks open positions from buy/sell history, and reconciles fund deposits/withdrawals."
     )
-
-    dhan_pw_saved = get_pdf_passwords()
+    
+    st.markdown("#### Upload Trade History CSV and Ledger Excel")
     c1, c2 = st.columns(2)
     with c1:
-        cn_files = st.file_uploader(
-            "Contract note PDFs (select all at once)", type=["pdf"], accept_multiple_files=True,
-            key="dhan_cn_files",
-        )
+        trades_file = st.file_uploader("Trade History CSV", type=["csv"], key="dhan_trades_file")
     with c2:
-        ledger_file = st.file_uploader("Ledger statement (.xls)", type=["xls", "xlsx"], key="dhan_ledger_file")
-
-    pw_options = ["-- type a new password --"] + [p["label"] for p in dhan_pw_saved]
-    pw_choice = st.selectbox("Contract note password", pw_options, key="dhan_pw_choice")
-    if pw_choice != "-- type a new password --":
-        dhan_password = next(p["password"] for p in dhan_pw_saved if p["label"] == pw_choice)
-    else:
-        dhan_password = st.text_input("Password (usually your PAN)", type="password", key="dhan_pw_typed")
-        save_label = st.text_input("Save as label for next time (optional)", key="dhan_pw_label")
-        if save_label and dhan_password:
-            save_statement_profile(save_label, password=dhan_password)
-
-    if st.button("Run reconciliation", key="dhan_run") and cn_files and ledger_file and dhan_password:
-        contract_notes = {}
-        parse_errors = []
-        for f in cn_files:
-            try:
-                note = dhan_parser.parse_contract_note(f.getvalue(), password=dhan_password)
-            except statement_parser.PasswordRequired:
-                parse_errors.append(f"{f.name}: wrong password")
-                continue
-            if not note["trade_date"]:
-                parse_errors.append(f"{f.name}: couldn't find a trade date — skipped")
-                continue
-            contract_notes[note["trade_date"]] = note
-
-        if parse_errors:
-            st.warning("Some files had issues:\n" + "\n".join(f"- {e}" for e in parse_errors))
-
-        if contract_notes:
-            ledger_df = dhan_parser.parse_ledger(ledger_file.getvalue())
-            ledger_table = dhan_reconcile.ledger_match_table(contract_notes, ledger_df)
-            continuity_table = dhan_reconcile.bfcf_continuity_table(contract_notes)
-            new_position_table = dhan_reconcile.new_position_table(contract_notes)
-            closed_position_table = dhan_reconcile.closed_position_table(contract_notes)
-            summary = dhan_reconcile.summarize(ledger_table, continuity_table,
-                                                new_position_table, closed_position_table)
-
-            st.session_state["dhan_results"] = {
-                "ledger_table": ledger_table, "continuity_table": continuity_table,
-                "new_position_table": new_position_table, "closed_position_table": closed_position_table,
-                "summary": summary,
-            }
-
-    results = st.session_state.get("dhan_results")
-    if results:
-        s = results["summary"]
+        ledger_file = st.file_uploader("Ledger Statement (Excel)", type=["xls", "xlsx"], key="dhan_ledger_file")
+    
+    if st.button("Run Trade History Reconciliation", key="dhan_trades_run") and trades_file and ledger_file:
+        # Parse files from uploaded bytes
+        trades_bytes = trades_file.getvalue()
+        ledger_bytes = ledger_file.getvalue()
+        
+        # Save to temp files for parsing (parsers expect file paths)
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.csv', delete=False) as tf:
+            tf.write(trades_bytes)
+            trades_path = tf.name
+        with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as lf:
+            lf.write(ledger_bytes)
+            ledger_path = lf.name
+        
+        try:
+            from core.dhan_reconcile import run_dhan_reconciliation
+            result = run_dhan_reconciliation(
+                trades_path=trades_path,
+                ledger_path=ledger_path,
+            )
+            st.session_state["dhan_trades_results"] = result
+        finally:
+            import os
+            os.unlink(trades_path)
+            os.unlink(ledger_path)
+    
+    # Display results
+    if "dhan_trades_results" in st.session_state:
+        result = st.session_state["dhan_trades_results"]
+        s = result.summary
+        
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Days checked", s["days_checked"])
-        m2.metric("Ledger mismatches", s["ledger_mismatches"])
-        m3.metric("BF/CF links checked", s["continuity_links_checked"])
-        m4.metric("Adjustments/errors found", s["continuity_breaks"])
-        m5, m6 = st.columns(2)
-        m5.metric("New positions opened", s["new_positions"], delta=f"-{s['new_positions_unmatched']} unmatched"
-                   if s["new_positions_unmatched"] else None)
-        m6.metric("Positions closed", s["closed_positions"], delta=f"-{s['closed_positions_unmatched']} unmatched"
-                   if s["closed_positions_unmatched"] else None)
-
-        st.markdown("### Contract note vs ledger, day by day")
-        lt = results["ledger_table"]
+        m1.metric("Ledger Date Range", s["ledger_date_range"])
+        m2.metric("Trades Date Range", s["trades_date_range"])
+        m3.metric("Total Trades", s["total_trades"])
+        m4.metric("Open Positions", s["open_positions"])
+        
+        m5, m6, m7, m8 = st.columns(4)
+        m5.metric("Trade-Ledger Matched", s["trade_ledger_matched"])
+        m6.metric("In Ledger Only", s["trade_ledger_in_ledger_only"])
+        m7.metric("Equity Matches", s["equity_matches"])
+        m8.metric("Derivative Matches", s["derivative_matches"])
+        
+        m9, m10, m11, m12 = st.columns(4)
+        m9.metric("Fund Deposits", s["total_fund_deposits"])
+        m10.metric("Fund Withdrawals", s["total_fund_withdrawals"])
+        m11.metric("Total Deposited", f"₹{s['total_deposited']:,.2f}")
+        m12.metric("Total Withdrawn", f"₹{s['total_withdrawn']:,.2f}")
+        
+        st.markdown("### Trade vs Ledger Match (Daily)")
+        match_df = result.trade_ledger_match
         st.dataframe(
-            lt.style.map(lambda v: "background-color:#4caf5033" if v == "OK"
-                         else ("background-color:#f4433633" if v == "MISMATCH" else ""),
-                         subset=["status"]),
+            match_df.style.map(
+                lambda v: "background-color:#4caf5033" if v == "MATCHED"
+                else ("background-color:#f4433633" if v == "IN LEDGER ONLY" else ""),
+                subset=["match_status"]
+            ),
             use_container_width=True,
         )
-
-        st.markdown("### F&O carry-forward price continuity")
-        ct = results["continuity_table"]
-        if ct.empty:
-            st.info("No continuing F&O positions found to check (or only one trading day uploaded).")
-        else:
-            breaks = ct[ct["status"] != "OK"]
-            if breaks.empty:
-                st.success(f"All {len(ct)} BF/CF links match exactly — no dividend adjustments or errors detected.")
-            else:
-                st.error(f"{len(breaks)} break(s) found — check against an actual corporate-action announcement "
-                         "before assuming it's an error:")
-                st.dataframe(breaks, use_container_width=True)
-            with st.expander("Show all links checked"):
-                st.dataframe(ct, use_container_width=True)
-
-        st.markdown("### New F&O positions — matched to an order?")
-        st.caption("Every position that appears with no prior-day carry-forward should trace back to an "
-                   "actual same-day buy/sell order (including a rollover's opening leg).")
-        npt = results["new_position_table"]
-        if npt.empty:
-            st.info("No new F&O positions opened in this batch.")
-        else:
-            unmatched = npt[npt["status"] != "OK - matched to order"]
-            if unmatched.empty:
-                st.success(f"All {len(npt)} new position(s) matched to a real order.")
-            else:
-                st.error(f"{len(unmatched)} new position(s) with NO matching order found:")
-                st.dataframe(unmatched, use_container_width=True)
-            with st.expander("Show all new positions"):
-                st.dataframe(npt, use_container_width=True)
-
-        st.markdown("### Closed F&O positions — matched to an order?")
-        cpt = results["closed_position_table"]
-        if cpt.empty:
-            st.info("No F&O positions closed in this batch.")
-        else:
-            unmatched = cpt[cpt["status"] != "OK - matched to order"]
-            if unmatched.empty:
-                st.success(f"All {len(cpt)} closed position(s) matched to a real order.")
-            else:
-                st.error(f"{len(unmatched)} closed position(s) with NO matching order found:")
-                st.dataframe(unmatched, use_container_width=True)
-                        with st.expander("Show all closed positions"):
-                # Pagination for all closed positions
-                cpt_page_size = 50
-                cpt_total = len(cpt)
-                cpt_n_pages = max(1, (cpt_total + cpt_page_size - 1) // cpt_page_size)
-                cpt_page = st.number_input("Closed positions page", 1, cpt_n_pages, 1, key="cpt_page") - 1
-                cpt_start = cpt_page * cpt_page_size
-                cpt_end = min(cpt_start + cpt_page_size, cpt_total)
-                st.caption(f"Showing {cpt_start+1}-{cpt_end} of {cpt_total} positions")
-                st.dataframe(cpt.iloc[cpt_start:cpt_end], use_container_width=True, height=400)
+        
+        # Show mismatches
+        mismatches = match_df[
+            (match_df['match_status'] == 'MATCHED') & (~match_df['amount_match'])
+        ]
+        if len(mismatches) > 0:
+            st.markdown("### Amount Mismatches (within ₹1 tolerance)")
+            st.dataframe(mismatches[['date', 'segment', 'net_value', 'ledger_net', 'diff']], use_container_width=True)
+        
+        st.markdown("### Fund Movements")
+        st.dataframe(result.fund_movements, use_container_width=True)
+        
+        st.markdown("### Current Open Positions")
+        st.dataframe(result.positions, use_container_width=True)
+        
+        st.markdown("### DP Charges")
+        st.dataframe(result.dp_charges, use_container_width=True)
 
 # ---------------------------------------------------- 5paisa Recon tab ---
 with tab_fivepaisa:
@@ -1650,7 +1604,6 @@ with tab_fivepaisa:
 
         st.markdown("### Contract note vs ledger, day by day")
         lt = results["ledger_table"]
-                lt = results["ledger_table"]
         # Pagination for performance
         lt_page_size = 50
         lt_total = len(lt)
@@ -1669,7 +1622,7 @@ with tab_fivepaisa:
             height=400,
         )
 
-                st.markdown("### B/F price continuity")
+        st.markdown("### B/F price continuity")
         ct = results["continuity_table"]
         if ct.empty:
             st.info("No continuing F&O positions found to check (or only one trading day uploaded).")

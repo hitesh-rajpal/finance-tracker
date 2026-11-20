@@ -1,239 +1,249 @@
-"""Parses Dhan (Raise Securities) contract notes and ledger statements.
+"""Parser for Dhan ledger and trade history files."""
 
-Unlike statement_parser/contract_note_parser, Dhan's layout is fixed and
-known (not broker-agnostic), so this module parses it directly from the
-PDF's flowing text rather than exposing a manual column-mapping step —
-the Equity and Derivative segment tables don't have real PDF gridlines,
-and the Derivative segment wraps a contract's description across 1-3
-lines in a way that shifts depending on how long the expiry/exchange
-suffix is, so table extraction doesn't work here at all.
+from __future__ import annotations
 
-Built from reconciling a real October 2026 statement set by hand — see
-that session for the worked example this logic was derived from.
-"""
-import io
-import re
-import pdfplumber
 import pandas as pd
-from dateutil import parser as dateparser
-
-from parsers.statement_parser import PasswordRequired  # reuse
-
-TRADE_DATE_RE = re.compile(r"Trade Date:\s*(\d{2})-(\d{2})-(\d{4})")
-CONTRACT_NO_RE = re.compile(r"Contract Note No:\s*(\d+)")
-NET_RECEIVABLE_RE = re.compile(
-    r"Net Amount Receivable.*?NCLCM.*?$", re.IGNORECASE
-)  # unused placeholder, real parsing is line-based below
-LEDGER_BALANCE_RE = re.compile(r"Ledger Balance\s+([\d,]+\.\d{2})\s*(CR|DR)", re.IGNORECASE)
-
-# Equity segment row, e.g.:
-#   "INE034A01011 ARVIND 1 499.5000 499.5000 499.50 1 -499.50"
-# We only need the ISIN, a human-readable name, and the net obligation
-# (last number on the line) — the buy/sell qty & WAP split isn't needed
-# for reconciliation and the column count varies depending on whether a
-# row has both a buy and sell leg that day.
-EQUITY_ROW_RE = re.compile(
-    r"^([A-Z]{2}[A-Z0-9]{9}\d)\s+(\S+)\s+.*?(-?[\d,]+\.\d{2})\s*$"
-)
+from datetime import date
+from typing import Literal
 
 
-def _iso_date(dd, mm, yyyy) -> str:
-    return f"{yyyy}-{mm}-{dd}"
-
-
-def _nums(text: str) -> list[str]:
-    return re.findall(r"-?[\d,]+(?:\.\d+)?", text)
-
-
-def _parse_derivative_rows(lines: list[str]) -> list[dict]:
-    """Extracts (kind, qty, wap) for every BF/CF/B/S row in the Derivative
-    Segment. `wap` is the carried-forward price: for a BF row this is the
-    PRIOR trading day's close (what should match that day's CF); for a CF
-    row this equals today's close (since carrying forward re-prices the
-    position at today's settlement). Comparing BF(day N+1) to CF(day N)
-    for the same contract is exactly the check that catches a NSE
-    dividend-adjustment (or a genuine broker error) in the carried price.
-
-    Handles both of Dhan's line layouts: the contract description on its
-    own line(s) followed by a BF/CF data line, or (when the description
-    is short) the description and BF/CF data on one line.
+def parse_dhan_ledger(filepath: str) -> pd.DataFrame:
     """
-    # Dhan wraps a contract's description across 1-2 lines, and which part
-    # comes before vs after the BF/CF/B/S data line is inconsistent (varies
-    # by how long the expiry/exchange suffix is) — so the expiry date can
-    # land either immediately before or immediately after the data row.
-    # A symbol/expiry pulled from only "pending_name" is therefore
-    # unreliable; look one line in both directions for the missing piece.
-    DATE_RE = re.compile(r"\d{2}[A-Za-z]{3}\d{4}")
-
-    rows = []
-    row_idx = []  # parallel list: index of the data line for each row, for the lookahead merge
-    pending_name = None
-    for i, raw_line in enumerate(lines):
-        line = raw_line.strip()
-        if not line:
-            continue
-        m1 = re.match(r"^(?:FUTSTK|FUTIDX)\s+(.*?)\s+(BF|CF|B|S)\s+(-?[\d,]+)\s+(.*)$", line)
-        if m1:
-            desc, kind, qty, rest = m1.groups()
-            name = "FUTSTK " + desc
-        else:
-            m2 = re.match(r"^(BF|CF|B|S)\s+(-?[\d,]+)\s+(.*)$", line)
-            if m2 and pending_name:
-                kind, qty, rest = m2.groups()
-                name = pending_name
-            elif re.match(r"^(FUTSTK|FUTIDX|OPTSTK|OPTIDX)\s", line):
-                pending_name = line
-                continue
-            else:
-                continue
-        nums = _nums(rest)
-        if len(nums) < 2:
-            continue
-        rows.append({
-            "name": name,
-            "kind": kind,
-            "qty": abs(int(qty.replace(",", ""))),
-            "wap": float(nums[0].replace(",", "")),
-        })
-        row_idx.append(i)
-        pending_name = None
-
-    for row, i in zip(rows, row_idx):
-        if DATE_RE.search(row["name"]):
-            continue
-        for j in (i + 1, i - 1):
-            if 0 <= j < len(lines):
-                frag = lines[j].strip()
-                if DATE_RE.search(frag) and not re.match(r"^(FUTSTK|FUTIDX|OPTSTK|OPTIDX|BF|CF|B\s|S\s)", frag):
-                    row["name"] = (row["name"] + " " + frag).strip()
-                    break
-
-    symbol_expiry_re = re.compile(r"(FUTSTK|FUTIDX)\s+([A-Z]+)\s+(\d{2}[A-Za-z]{3}\d{4})")
-    for row in rows:
-        m = symbol_expiry_re.search(row["name"])
-        row["symbol"] = m.group(2) if m else None
-        row["expiry"] = m.group(3) if m else None
-
-    return rows
-
-
-def parse_contract_note(pdf_bytes: bytes, password: str | None = None) -> dict:
-    """Returns a dict:
-        trade_date (ISO str), contract_no (str),
-        equity_rows: [{isin, name, net_obligation}],
-        derivative_rows: [{name, kind, qty, wap}]   (kind: BF/CF/B/S),
-        segment_totals: {NCLCM, NCLFO, Total}  (signed: CR positive, DR negative),
-        ledger_balance: float or None (signed),
-    Raises PasswordRequired if the password is missing/wrong.
+    Parse Dhan ledger Excel file.
+    
+    The file has a header row at index 9 (0-indexed) with columns:
+    Date, Transaction ID, Narration, Voucher Descriptions, Debit, Credit
     """
-    try:
-        pdf_ctx = pdfplumber.open(io.BytesIO(pdf_bytes), password=password)
-    except Exception as e:
-        raise PasswordRequired(str(e)) from e
+    df = pd.read_excel(filepath, header=9)
+    df.columns = [
+        'Date', 'Transaction_ID', 'Narration', 'Voucher_Descriptions',
+        'Debit', 'Credit', 'c6', 'c7', 'c8', 'c9', 'c10', 'footer'
+    ]
+    
+    # Drop the first row which is a duplicate header
+    df = df.iloc[1:].reset_index(drop=True)
+    
+    # Parse date
+    df['date'] = pd.to_datetime(df['Date'], format='%b %d, %Y', errors='coerce').dt.date
+    
+    # Parse amounts (Debit is negative/outflow, Credit is positive/inflow)
+    df['debit'] = pd.to_numeric(df['Debit'], errors='coerce').fillna(0.0)
+    df['credit'] = pd.to_numeric(df['Credit'], errors='coerce').fillna(0.0)
+    
+    # Net amount: credit + debit (debit is already negative = money out, credit positive = money in)
+    df['amount'] = df['credit'] + df['debit']
+    
+    # Direction
+    df['direction'] = df.apply(
+        lambda r: 'credit' if r['credit'] > 0 else ('debit' if r['debit'] < 0 else 'none'), axis=1
+    )
+    
+    # Clean up
+    df = df.dropna(subset=['date'])
+    df = df[~df['Narration'].isin(['Narration', 'Voucher Descriptions'])]  # Remove any stray headers
+    
+    return df[['date', 'Transaction_ID', 'Narration', 'Voucher_Descriptions', 
+               'debit', 'credit', 'amount', 'direction']].copy()
 
-    with pdf_ctx as pdf:
-        pages_text = [p.extract_text() or "" for p in pdf.pages]
-    full_text = "\n".join(pages_text)
-    lines = full_text.split("\n")
 
-    m = TRADE_DATE_RE.search(full_text)
-    trade_date = _iso_date(m.group(1), m.group(2), m.group(3)) if m else None
-    m = CONTRACT_NO_RE.search(full_text)
-    contract_no = m.group(1) if m else None
+def parse_dhan_trades(filepath: str) -> pd.DataFrame:
+    """
+    Parse Dhan trade history CSV file.
+    
+    Columns: Date, Time, Name, Buy/Sell, Order, Exchange, Segment, 
+             Quantity/Lot, Trade Price, Trade Value, Status
+    """
+    df = pd.read_csv(filepath)
+    
+    # Parse date
+    df['date'] = pd.to_datetime(df['Date'], errors='coerce').dt.date
+    df['time'] = pd.to_datetime(df['Time'], format='%H:%M:%S', errors='coerce').dt.time
+    
+    # Parse numeric
+    df['quantity'] = pd.to_numeric(df['Quantity/Lot'], errors='coerce').fillna(0).astype(int)
+    df['price'] = pd.to_numeric(df['Trade Price'], errors='coerce').fillna(0.0)
+    df['value'] = pd.to_numeric(df['Trade Value'], errors='coerce').fillna(0.0)
+    
+    # Normalize side
+    df['side'] = df['Buy/Sell'].str.strip().str.capitalize()  # 'Buy' or 'Sell'
+    
+    # Segment: 'Equity' or 'Derivative'
+    df['segment'] = df['Segment'].str.strip()
+    
+    # Order type: 'MARGIN' or 'DELIVERY'
+    df['order_type'] = df['Order'].str.strip()
+    
+    # Symbol/contract name
+    df['symbol'] = df['Name'].str.strip()
+    
+    # Exchange
+    df['exchange'] = df['Exchange'].str.strip()
+    
+    # Status
+    df['status'] = df['Status'].str.strip()
+    
+    # Only keep 'Traded' status
+    df = df[df['status'] == 'Traded'].copy()
+    
+    return df[['date', 'time', 'symbol', 'side', 'quantity', 'price', 'value',
+               'segment', 'order_type', 'exchange', 'status']].copy()
 
-    equity_rows = []
-    for line in lines:
-        m = EQUITY_ROW_RE.match(line.strip())
-        if m:
-            isin, name, net_obl = m.groups()
-            equity_rows.append({
-                "isin": isin,
-                "name": name,
-                "net_obligation": float(net_obl.replace(",", "")),
+
+def extract_symbol_expiry_dhan(symbol: str) -> tuple[str, str | None, Literal['FUT', 'OPT', 'EQ'] | None]:
+    """
+    Extract base symbol, expiry, and instrument type from Dhan symbol format.
+    
+    Examples:
+    - 'BANDHANBNK NOV FUT' -> ('BANDHANBNK', '2025-11-27', 'FUT')  (last Thursday)
+    - 'NIFTY 17 NOV 24500 PUT' -> ('NIFTY', '2025-11-17', 'OPT')
+    - 'HDFC Bank' -> ('HDFC Bank', None, 'EQ')
+    """
+    symbol = symbol.strip().upper()
+    
+    # Check for FUT format: SYMBOL MON FUT
+    import re
+    fut_match = re.match(r'^([A-Z0-9&]+)\s+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+FUT$', symbol)
+    if fut_match:
+        base = fut_match.group(1)
+        month_str = fut_match.group(2)
+        # Need to determine year from context - for now return month
+        return base, month_str, 'FUT'
+    
+    # Check for OPT format: SYMBOL DD MON STRIKE CALL/PUT
+    opt_match = re.match(r'^([A-Z0-9&]+)\s+(\d{1,2})\s+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+(\d+(?:\.\d+)?)\s+(CALL|PUT)$', symbol)
+    if opt_match:
+        base = opt_match.group(1)
+        day = opt_match.group(2)
+        month = opt_match.group(3)
+        strike = opt_match.group(4)
+        opt_type = opt_match.group(5)
+        return base, f"{day}-{month}", 'OPT'
+    
+    # Check for equity (no FUT/OPT)
+    if 'FUT' not in symbol and 'CALL' not in symbol and 'PUT' not in symbol:
+        return symbol, None, 'EQ'
+    
+    return symbol, None, None
+
+
+def compute_dhan_positions(trades_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute current open positions from trade history.
+    
+    For each symbol, match buys and sells (FIFO) to find remaining quantity.
+    """
+    from collections import defaultdict
+    
+    # Group by symbol and process chronologically
+    trades_df = trades_df.sort_values(['symbol', 'date', 'time']).reset_index(drop=True)
+    
+    positions = defaultdict(list)  # symbol -> list of (qty, price, date, side)
+    
+    for _, trade in trades_df.iterrows():
+        sym = trade['symbol']
+        qty = trade['quantity']
+        price = trade['price']
+        side = trade['side']
+        dt = trade['date']
+        
+        if side == 'Buy':
+            positions[sym].append({'qty': qty, 'price': price, 'date': dt, 'side': 'Buy'})
+        else:  # Sell
+            remaining = qty
+            # FIFO match against existing buys
+            new_positions = []
+            for pos in positions[sym]:
+                if pos['side'] == 'Buy' and pos['qty'] > 0:
+                    if pos['qty'] <= remaining:
+                        remaining -= pos['qty']
+                        pos['qty'] = 0
+                    else:
+                        pos['qty'] -= remaining
+                        remaining = 0
+                        break
+                new_positions.append(pos)
+            
+            # If there's remaining sell qty (short position), add as short
+            if remaining > 0:
+                new_positions.append({'qty': remaining, 'price': price, 'date': dt, 'side': 'Sell'})
+            
+            positions[sym] = [p for p in new_positions if p['qty'] > 0]
+    
+    # Build result dataframe
+    results = []
+    for sym, pos_list in positions.items():
+        for pos in pos_list:
+            results.append({
+                'symbol': sym,
+                'side': pos['side'],
+                'quantity': pos['qty'],
+                'avg_price': pos['price'],
+                'open_date': pos['date'],
             })
-
-    derivative_rows = _parse_derivative_rows(lines)
-
-    segment_totals = {}
-    net_line = None
-    for line in lines:
-        if "Net Amount Receivable" in line:
-            net_line = line  # last occurrence wins (the Total/summary one)
-    if net_line:
-        pairs = re.findall(r"([\d,]+\.\d{2})\s*(DR|CR)", net_line)
-        keys = ["NCLCM", "NCLFO", "Total"]
-        # some days only have one segment (e.g. equity-only or F&O-only) —
-        # map from the right so "Total" (last) is always correct
-        for key, (amt, side) in zip(keys[-len(pairs):], pairs):
-            val = float(amt.replace(",", ""))
-            segment_totals[key] = -val if side == "DR" else val
-
-    ledger_balance = None
-    m = LEDGER_BALANCE_RE.search(full_text)
-    if m:
-        val = float(m.group(1).replace(",", ""))
-        ledger_balance = -val if m.group(2).upper() == "DR" else val
-
-    return {
-        "trade_date": trade_date,
-        "contract_no": contract_no,
-        "equity_rows": equity_rows,
-        "derivative_rows": derivative_rows,
-        "segment_totals": segment_totals,
-        "ledger_balance": ledger_balance,
-    }
+    
+    return pd.DataFrame(results)
 
 
-def _find_header_row(raw: pd.DataFrame) -> int:
-    """Dhan's ledger/PnL xls files have a ~5-row letterhead before the real
-    header, but the exact row count isn't guaranteed stable across Dhan
-    template versions, so detect it instead of hardcoding header=4."""
-    for i in range(min(15, len(raw))):
-        row_text = " ".join(str(v) for v in raw.iloc[i].tolist()).lower()
-        if "date" in row_text and "debit" in row_text and "credit" in row_text:
-            return i
-    return 4  # fallback to the offset seen in practice
+def match_dhan_trades_to_ledger(trades_df: pd.DataFrame, ledger_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Match Dhan trade executed amounts to ledger 'Trades Executed' entries.
+    
+    The ledger has daily net trade amounts (F&O and Equity Cash separately).
+    We aggregate trades by date and segment and compare.
+    
+    Sign convention:
+    - Ledger: amount = credit + debit (positive = money in to client, negative = money out)
+    - Trades: sell = money in (positive), buy = money out (negative)
+    - net_value = total_sell - total_buy (should match ledger amount)
+    """
+    # Aggregate trades by date and segment
+    trades_df = trades_df.copy()
+    trades_df['signed_value'] = trades_df.apply(
+        lambda r: r['value'] if r['side'] == 'Sell' else -r['value'], axis=1
+    )
+    
+    trade_agg = trades_df.groupby(['date', 'segment']).agg(
+        total_buy_value=('value', lambda x: x[trades_df.loc[x.index, 'side'] == 'Buy'].sum()),
+        total_sell_value=('value', lambda x: x[trades_df.loc[x.index, 'side'] == 'Sell'].sum()),
+        net_value=('signed_value', 'sum'),
+        trade_count=('value', 'count')
+    ).reset_index()
+    
+    # Filter ledger for trade executions
+    ledger_trades = ledger_df[ledger_df['Narration'] == 'Trades Executed'].copy()
+    
+    # Parse voucher description to get segment
+    def get_segment(voucher):
+        voucher = str(voucher).upper()
+        if 'EQUITY CASH' in voucher:
+            return 'Equity'
+        elif 'F&O' in voucher or 'FNO' in voucher:
+            return 'Derivative'
+        return 'Unknown'
+    
+    ledger_trades['segment'] = ledger_trades['Voucher_Descriptions'].apply(get_segment)
+    ledger_trades['ledger_net'] = ledger_trades['amount']  # Already credit - debit
+    
+    # Merge
+    merged = pd.merge(trade_agg, ledger_trades[['date', 'segment', 'ledger_net', 'Transaction_ID']], 
+                      on=['date', 'segment'], how='outer', indicator=True)
+    
+    merged['match_status'] = merged['_merge'].map({
+        'both': 'MATCHED',
+        'left_only': 'IN TRADES ONLY',
+        'right_only': 'IN LEDGER ONLY'
+    })
+    
+    # Compare amounts
+    merged['diff'] = merged['net_value'] - merged['ledger_net']
+    merged['amount_match'] = merged['diff'].abs() < 1.0  # Within ₹1
+    
+    return merged
 
 
-def parse_ledger(xls_bytes: bytes) -> pd.DataFrame:
-    """Returns a cleaned ledger DataFrame with columns:
-    Date (datetime64), Type (str, stripped), Description, Debit (float),
-    Credit (float), RunningBalance (float, signed CR positive).
-
-    Handles both Dhan ledger layouts seen in practice: the older export with
-    an explicit `Type` column, and the newer one with
-    Date / Transaction ID / Narration / Voucher Descriptions / Debit / Credit
-    (where Narration holds "Trades Executed")."""
-    raw = pd.read_excel(io.BytesIO(xls_bytes), header=None)
-    header_row = _find_header_row(raw)
-    df = pd.read_excel(io.BytesIO(xls_bytes), header=header_row)
-    df.columns = [str(c).strip() for c in df.columns]
-    df = df.dropna(subset=["Date"]).copy()
-
-    if "Type" not in df.columns:
-        for candidate in ("Narration", "Voucher Descriptions"):
-            if candidate in df.columns:
-                df["Type"] = df[candidate]
-                break
-    if "Description" not in df.columns:
-        for candidate in ("Voucher Descriptions", "Narration"):
-            if candidate in df.columns:
-                df["Description"] = df[candidate]
-                break
-    if "Description" not in df.columns:
-        df["Description"] = ""
-
-    df["Date"] = pd.to_datetime(df["Date"].astype(str).str.strip(), errors="coerce", dayfirst=True)
-    df["Type"] = df["Type"].astype(str).str.strip()
-    for col in ("Debit", "Credit"):
-        df[col] = pd.to_numeric(
-            df[col].astype(str).str.replace(",", "", regex=False), errors="coerce"
-        ).fillna(0.0)
-    # Newer Dhan exports store debits as negative numbers (credit column
-    # stays positive). Normalise to the traditional positive-debit form so
-    # ledger_match_table's Credit - Debit convention works for both layouts.
-    if (df["Debit"] < 0).any():
-        df["Debit"] = df["Debit"].abs()
-    df = df.dropna(subset=["Date"])
-    return df.reset_index(drop=True)
+def get_dhan_fund_movements(ledger_df: pd.DataFrame) -> pd.DataFrame:
+    """Extract fund deposits and withdrawals from Dhan ledger."""
+    funds = ledger_df[ledger_df['Narration'].isin(['Funds Deposited', 'Funds Withdrawal'])].copy()
+    funds = funds[['date', 'Narration', 'Voucher_Descriptions', 'amount']].copy()
+    funds.columns = ['date', 'type', 'description', 'amount']
+    return funds.sort_values('date').reset_index(drop=True)
