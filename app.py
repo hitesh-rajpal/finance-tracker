@@ -2020,29 +2020,39 @@ with tab_investments:
                "point-in-time snapshot you (or another tool via API) check and record periodically, "
                "not something derived from transactions.")
 
-    policies = get_investment_policies()
+    # Cache policies list too
+    @st.cache_data(ttl=300)
+    def get_policies_cached():
+        return get_investment_policies()
+
+    policies = get_policies_cached()
     policy_options = {p["label"]: p["key"] for p in policies}
 
     # ----- Cached data loading -----
     @st.cache_data(ttl=300, show_spinner="Loading investment data...")
     def load_investment_data():
-        with get_conn() as _conn:
-            with _conn.cursor() as _cur:
-                _cur.execute("""
-                    SELECT s.id, p.label, s.as_of_date, s.total_value, s.source,
-                           f.fund_name, f.units, f.nav, f.value
-                    FROM investment_value_snapshots s
-                    JOIN investment_policies p ON p.key = s.policy_key
-                    LEFT JOIN investment_snapshot_funds f ON f.snapshot_id = s.id
-                    ORDER BY p.label, s.as_of_date, f.fund_name
-                """)
-                snap_data = _cur.fetchall()
-                _cur.execute("SELECT * FROM investment_policies ORDER BY label")
-                pol_data = _cur.fetchall()
-        return snap_data, pol_data
+        try:
+            with get_conn() as _conn:
+                with _conn.cursor() as _cur:
+                    _cur.execute("""
+                        SELECT s.id, p.label, s.as_of_date, s.total_value, s.source,
+                               f.fund_name, f.units, f.nav, f.value
+                        FROM investment_value_snapshots s
+                        JOIN investment_policies p ON p.key = s.policy_key
+                        LEFT JOIN investment_snapshot_funds f ON f.snapshot_id = s.id
+                        ORDER BY p.label, s.as_of_date, f.fund_name
+                    """)
+                    snap_data = _cur.fetchall()
+                    _cur.execute("SELECT * FROM investment_policies ORDER BY label")
+                    pol_data = _cur.fetchall()
+            return snap_data, pol_data
+        except Exception as e:
+            st.error(f"Database error: {e}")
+            return [], []
 
-    # Load data (cached)
-    _all_snap_data, _all_policies = load_investment_data()
+    # Load data (cached) - show spinner while loading
+    with st.spinner("Loading investment data..."):
+        _all_snap_data, _all_policies = load_investment_data()
 
     if not _all_snap_data:
         st.info("No investment snapshots found. Add a policy and snapshot first using the forms below.")
