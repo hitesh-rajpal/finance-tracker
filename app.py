@@ -2198,6 +2198,8 @@ with tab_investments:
             from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
             from openpyxl.utils import get_column_letter
 
+            wb = openpyxl.Workbook()
+
             # Style helpers
             header_font = Font(bold=True, color="FFFFFF")
             header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
