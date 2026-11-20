@@ -2051,8 +2051,10 @@ with tab_investments:
             return [], []
 
     # Load data (cached) - show spinner while loading
-    with st.spinner("Loading investment data..."):
-        _all_snap_data, _all_policies = load_investment_data()
+    loading_placeholder = st.empty()
+    loading_placeholder.info("🔄 Loading investment data from database...")
+    _all_snap_data, _all_policies = load_investment_data()
+    loading_placeholder.empty()
 
     if not _all_snap_data:
         st.info("No investment snapshots found. Add a policy and snapshot first using the forms below.")
