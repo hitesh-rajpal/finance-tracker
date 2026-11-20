@@ -2156,8 +2156,8 @@ with tab_investments:
                 }
             )
 
-    # ----- Excel Export (all data, multi-sheet) -----
-    if policies and _all_snap_data:
+        # ----- Excel Export (all data, multi-sheet) -----
+        if policies:
             import io
             import openpyxl
             from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
