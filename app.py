@@ -1,5 +1,6 @@
 import hmac
 import io
+import os
 import re
 import uuid
 from datetime import date
@@ -166,7 +167,16 @@ def render_logout():
 
 
 require_login()
-init_db()
+
+
+@st.cache_resource(show_spinner=False)
+def _init_db_once():
+    """Run the schema DDL once per process, not on every rerun (it's ~1s of
+    DDL round-trips against a remote Supabase database)."""
+    init_db()
+
+
+_init_db_once()
 ensure_party("Office")
 render_logout()
 
@@ -415,16 +425,23 @@ def _deploy_info():
     return f"built {datetime.datetime.now():%Y-%m-%d %H:%M}"
 st.caption(_deploy_info())
 
-(tab_upload, tab_uploads_log, tab_notes, tab_review, tab_accounts, tab_parties, tab_claims, tab_reports,
- tab_trading, tab_recon, tab_dhan, tab_fivepaisa, tab_fund_flow, tab_investments, tab_rules, tab_archive_upload) = st.tabs(
-    ["📥 Upload", "📁 Uploads", "🗂️ Note Coverage", "🏷️ Review & Categorize", "🏦 Accounts", "🎭 Parties",
-     "🧾 Expense Claims", "📊 Reports", "📈 Trading", "🔗 Reconciliation", "🪙 Dhan Recon", "🏦 5paisa Recon",
-     "💸 Fund Flow Recon", "💹 Investments",
-     "🎯 Expected & Cross-Check", "📦 Bulk Archive Upload"]
-)
+# Only the selected section's code runs. Streamlit executes every st.tabs
+# body on each rerun — even the hidden ones — so with 16 sections each doing
+# its own DB queries / file scans / Storage calls, the app could take 40s+
+# before it painted anything. This pills control reruns the script with only
+# the chosen section active, so the app opens in a couple of seconds.
+_TAB_LABELS = [
+    "📥 Upload", "📁 Uploads", "🗂️ Note Coverage", "🏷️ Review & Categorize", "🏦 Accounts", "🎭 Parties",
+    "🧾 Expense Claims", "📊 Reports", "📈 Trading", "🔗 Reconciliation", "🪙 Dhan Recon", "🏦 5paisa Recon",
+    "💸 Fund Flow Recon", "💹 Investments", "🎯 Expected & Cross-Check", "📦 Bulk Archive Upload",
+]
+_active = st.pills("Section", _TAB_LABELS, default=_TAB_LABELS[0], selection_mode="single",
+                   key="active_section", label_visibility="collapsed")
+if _active is None:
+    _active = _TAB_LABELS[0]
 
 # ---------------------------------------------------------------- Upload ---
-with tab_upload:
+if _active == "📥 Upload":
     st.subheader("Bank SMS alerts")
     st.caption(
         "Upload a .txt file. Works best as forwarded-to-yourself chat text: each bank alert "
@@ -638,7 +655,7 @@ with tab_upload:
                 st.rerun()
 
 # --------------------------------------------------------- Uploads tab ----
-with tab_uploads_log:
+if _active == "📁 Uploads":
     st.caption(
         "Every 'Parse & save' / 'Add transactions' click, with what happened. Expand a batch to see "
         "exactly which rows were newly saved and which were skipped because they matched something "
@@ -653,69 +670,98 @@ with tab_uploads_log:
     if not batches:
         st.info("No uploads yet.")
     else:
-        for b in batches:
-            title = (
-                f"{b['uploaded_at']:%Y-%m-%d %H:%M} — {b['source_file'] or '(unnamed)'} "
-                f"({source_type_labels.get(b['source_type'], b['source_type'])}) — "
-                f"parsed {b['parsed_count']}, saved {b['saved_count']}, skipped {b['skipped_count']}"
-            )
-            with st.expander(title):
-                saved_rows = get_batch_transactions(b["id"]) if b["saved_count"] else []
-                st.markdown(f"**✅ Saved (new) — {len(saved_rows)}:**")
-                if saved_rows:
-                    st.dataframe(
-                        one_indexed(pd.DataFrame(saved_rows)[["date", "amount", "direction", "category", "description"]]),
-                        use_container_width=True,
+        # Render a cheap summary first. The old version expanded every batch at
+        # once, which meant a DB query + a Supabase Storage signed-URL request
+        # for each of ~1,700 batches on every single rerun — that's what made
+        # the whole app appear to hang. Now only the batch you pick is loaded.
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Upload batches", len(batches))
+        c2.metric("Rows saved", sum(b["saved_count"] or 0 for b in batches))
+        c3.metric("Rows skipped", sum(b["skipped_count"] or 0 for b in batches))
+
+        summary_df = pd.DataFrame([
+            {
+                "Uploaded": b["uploaded_at"],
+                "File": b["source_file"] or "(unnamed)",
+                "Type": source_type_labels.get(b["source_type"], b["source_type"]),
+                "Parsed": b["parsed_count"],
+                "Saved": b["saved_count"],
+                "Skipped": b["skipped_count"],
+            }
+            for b in batches
+        ])
+        st.dataframe(summary_df, use_container_width=True, hide_index=True, height=300)
+
+        idx = st.selectbox(
+            "Inspect a batch",
+            options=list(range(len(batches))),
+            format_func=lambda i: (
+                f"{batches[i]['uploaded_at']:%Y-%m-%d %H:%M} — {batches[i]['source_file'] or '(unnamed)'} "
+                f"({source_type_labels.get(batches[i]['source_type'], batches[i]['source_type'])}) — "
+                f"parsed {batches[i]['parsed_count']}, saved {batches[i]['saved_count']}, "
+                f"skipped {batches[i]['skipped_count']}"
+            ),
+            key="uploads_inspect_idx",
+        )
+        b = batches[idx]
+        with st.container(border=True):
+            saved_rows = get_batch_transactions(b["id"]) if b["saved_count"] else []
+            st.markdown(f"**✅ Saved (new) — {len(saved_rows)}:**")
+            if saved_rows:
+                st.dataframe(
+                    one_indexed(pd.DataFrame(saved_rows)[["date", "amount", "direction", "category", "description"]]),
+                    use_container_width=True,
+                )
+            elif b["saved_count"]:
+                st.caption(f"{b['saved_count']} row(s) were saved here originally but have since been "
+                           "deleted or edited elsewhere.")
+            else:
+                st.caption("Nothing new — every parsed row already existed.")
+
+            st.markdown(f"**⏭️ Skipped (already recorded) — {b['skipped_count']}:**")
+            if b["skipped_count"]:
+                matches = get_upload_matches(b["id"])
+                for m in matches:
+                    reason = "same reference number" if m["match_reason"] == "reference_number" else "same amount/date"
+                    st.markdown(
+                        f"- Incoming ({m['new_date']}, ₹{m['new_amount']:,.2f}): "
+                        f"`{(m['new_raw_text'] or '')[:120]}`\n\n"
+                        f"  → matched existing transaction from **{m['matched_source'] or '?'}** "
+                        f"(`{m['matched_source_file'] or '?'}`, {m['matched_date']}, "
+                        f"₹{m['matched_amount']:,.2f}): `{(m['matched_description'] or '')[:120]}` "
+                        f"— matched by {reason}"
                     )
-                elif b["saved_count"]:
-                    st.caption(f"{b['saved_count']} row(s) were saved here originally but have since been "
-                               "deleted or edited elsewhere.")
-                else:
-                    st.caption("Nothing new — every parsed row already existed.")
+            else:
+                st.caption("Nothing was skipped — every parsed row was new.")
 
-                st.markdown(f"**⏭️ Skipped (already recorded) — {b['skipped_count']}:**")
-                if b["skipped_count"]:
-                    matches = get_upload_matches(b["id"])
-                    for m in matches:
-                        reason = "same reference number" if m["match_reason"] == "reference_number" else "same amount/date"
-                        st.markdown(
-                            f"- Incoming ({m['new_date']}, ₹{m['new_amount']:,.2f}): "
-                            f"`{(m['new_raw_text'] or '')[:120]}`\n\n"
-                            f"  → matched existing transaction from **{m['matched_source'] or '?'}** "
-                            f"(`{m['matched_source_file'] or '?'}`, {m['matched_date']}, "
-                            f"₹{m['matched_amount']:,.2f}): `{(m['matched_description'] or '')[:120]}` "
-                            f"— matched by {reason}"
-                        )
-                else:
-                    st.caption("Nothing was skipped — every parsed row was new.")
-
-                scfg = storage_cfg()
-                if b.get("file_storage_path"):
-                    if scfg:
-                        url = file_storage.signed_url(scfg["url"], scfg["service_role_key"], b["file_storage_path"])
-                        if url:
-                            st.link_button("📄 Download original file", url)
-                        else:
-                            st.caption("Original file is saved, but couldn't generate a download link right now.")
+            scfg = storage_cfg()
+            if b.get("file_storage_path"):
+                if scfg:
+                    # Only fetched for the one batch being inspected, not all of them.
+                    url = file_storage.signed_url(scfg["url"], scfg["service_role_key"], b["file_storage_path"])
+                    if url:
+                        st.link_button("📄 Download original file", url)
                     else:
-                        st.caption("Original file is saved, but Storage isn't configured to fetch it right now.")
-                elif scfg:
-                    st.caption("No original file kept for this upload (e.g. a cash entry, or uploaded before "
-                               "file storage was added).")
+                        st.caption("Original file is saved, but couldn't generate a download link right now.")
+                else:
+                    st.caption("Original file is saved, but Storage isn't configured to fetch it right now.")
+            elif scfg:
+                st.caption("No original file kept for this upload (e.g. a cash entry, or uploaded before "
+                           "file storage was added).")
 
-                confirm_key = f"confirm_del_{b['id']}"
-                confirm = st.checkbox(f"Yes, delete the {b['saved_count']} transaction(s) this batch saved"
-                                       + (" and its stored file" if b.get("file_storage_path") else ""),
-                                       key=confirm_key)
-                if st.button("Delete this batch", key=f"del_{b['id']}", disabled=not confirm):
-                    if b.get("file_storage_path") and scfg:
-                        file_storage.delete_file(scfg["url"], scfg["service_role_key"], b["file_storage_path"])
-                    delete_upload_batch(b["id"], b["source_file"])
-                    st.success("Batch, its transactions, and its stored file (if any) were deleted.")
-                    st.rerun()
+            confirm_key = f"confirm_del_{b['id']}"
+            confirm = st.checkbox(f"Yes, delete the {b['saved_count']} transaction(s) this batch saved"
+                                   + (" and its stored file" if b.get("file_storage_path") else ""),
+                                   key=confirm_key)
+            if st.button("Delete this batch", key=f"del_{b['id']}", disabled=not confirm):
+                if b.get("file_storage_path") and scfg:
+                    file_storage.delete_file(scfg["url"], scfg["service_role_key"], b["file_storage_path"])
+                delete_upload_batch(b["id"], b["source_file"])
+                st.success("Batch, its transactions, and its stored file (if any) were deleted.")
+                st.rerun()
 
 # ---------------------------------------------------- Note Coverage tab ----
-with tab_notes:
+if _active == "🗂️ Note Coverage":
     st.subheader("Contract note archive — coverage")
     st.caption(
         "The scanned copy of each broker's archive is kept in Supabase, so this tab works "
@@ -856,7 +902,7 @@ with tab_notes:
         st.code("python scripts/note_coverage.py", language="bash")
 
 # --------------------------------------------------------- Review tab -----
-with tab_review:
+if _active == "🏷️ Review & Categorize":
     df = load_df()
     if df.empty:
         st.info("No transactions yet — upload some data first.")
@@ -989,7 +1035,7 @@ with tab_review:
                 st.rerun()
 
 # ------------------------------------------------------- Accounts tab -----
-with tab_accounts:
+if _active == "🏦 Accounts":
     st.caption(
         "Every distinct bank/card the parsers have seen gets a row here automatically "
         "(e.g. 'kotak xx2071' the first time a Kotak x2071 transaction is parsed). "
@@ -1020,7 +1066,7 @@ with tab_accounts:
             st.rerun()
 
 # -------------------------------------------------------- Parties tab -----
-with tab_parties:
+if _active == "🎭 Parties":
     st.caption(
         "The master list of names a transaction's Parties can be picked from (used in Review & "
         "Categorize). 'Office' always exists — it's what drives the office-expense reports."
@@ -1057,7 +1103,7 @@ with tab_parties:
                 st.rerun()
 
 # ------------------------------------------------- Expense Claims tab -----
-with tab_claims:
+if _active == "🧾 Expense Claims":
     df = load_df()
     if df.empty:
         st.info("No transactions yet — upload some data first.")
@@ -1213,7 +1259,7 @@ with tab_claims:
                 )
 
 # -------------------------------------------------------- Reports tab -----
-with tab_reports:
+if _active == "📊 Reports":
     df = load_df()
     if df.empty:
         st.info("No transactions yet — upload some data first.")
@@ -1282,7 +1328,7 @@ with tab_reports:
             st.dataframe(inc, use_container_width=True)
 
 # -------------------------------------------------------- Trading tab -----
-with tab_trading:
+if _active == "📈 Trading":
     df = load_df()
     trades = df[df["source"] == "contract_note"] if not df.empty else df
     if trades.empty:
@@ -1297,7 +1343,7 @@ with tab_trading:
         )
 
 # --------------------------------------------------- Reconciliation tab ---
-with tab_recon:
+if _active == "🔗 Reconciliation":
     df = load_df()
     if df.empty:
         st.info("No transactions yet.")
@@ -1322,7 +1368,7 @@ with tab_recon:
                         use_container_width=True)
 
 # ------------------------------------------------------- Dhan Recon tab ---
-with tab_dhan:
+if _active == "🪙 Dhan Recon":
     st.caption(
         "Dhan reconciliation: Trade History (CSV) + Ledger (Excel) — matches daily trade P&L to ledger, "
         "tracks open positions from buy/sell history, and reconciles fund deposits/withdrawals."
@@ -1413,7 +1459,7 @@ with tab_dhan:
         st.dataframe(result.dp_charges, use_container_width=True)
 
 # ---------------------------------------------------- 5paisa Recon tab ---
-with tab_fivepaisa:
+if _active == "🏦 5paisa Recon":
     st.caption(
         "Upload a batch of 5paisa contract note PDFs + the 5paisa ledger statement (xlsx). "
         "Checks every day's contract note total (equity/F&O + commodity summed) against the "
@@ -1857,7 +1903,7 @@ with tab_fivepaisa:
             st.success("No known pending notes from coverage scan.")
 
 # ------------------------------------------------------ Fund Flow Recon ---
-with tab_fund_flow:
+if _active == "💸 Fund Flow Recon":
     st.caption(
         "Cross-check money movement between the 5paisa ledger, your IndusInd HUF bank "
         "statement and the CAS mutual-fund transactions. First upload the IndusInd "
@@ -2016,10 +2062,16 @@ with tab_fund_flow:
             c3.metric("B/F breaks", fps["continuity_breaks"])
 
 # --------------------------------------------------------- Investments ---
-with tab_investments:
+if _active == "💹 Investments":
     st.caption("Track ULIP/investment policies that live outside bank statements — fund value is a "
                "point-in-time snapshot you (or another tool via API) check and record periodically, "
                "not something derived from transactions.")
+
+    # Defaults so the "Add policy" / "Record snapshot" forms below never hit an
+    # undefined name while the data hasn't been loaded yet.
+    policies = []
+    policy_options = {}
+    snap_data = []
 
     # Initialize session state
     if "inv_policies" not in st.session_state:
@@ -2535,7 +2587,7 @@ with tab_investments:
                 st.dataframe(pd.DataFrame([x for x in snap_data if x["id"] == latest_snap["id"] and x["fund_name"]]), use_container_width=True)
 
 # ------------------------------------------------- Expected & Cross-Check -
-with tab_rules:
+if _active == "🎯 Expected & Cross-Check":
     st.caption(
         "Define what you EXPECT — savings interest at a rate, credit-card cashback at a rate, "
         "a loan on its own amortization schedule, or any other fixed recurring transfer with a "
@@ -2686,7 +2738,7 @@ with tab_rules:
             st.rerun()
 
 # -------------------------------------------------- Bulk Archive Upload tab -
-with tab_archive_upload:
+if _active == "📦 Bulk Archive Upload":
     st.caption(
         "Upload the entire local contract-note archive (Dhan + 5paisa) to Supabase Storage, "
         "so the app can parse/reconcile them. Files already uploaded are skipped. "
@@ -2819,3 +2871,5 @@ with tab_archive_upload:
             } for b in batches]),
             use_container_width=True, hide_index=True,
         )
+
+
