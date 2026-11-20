@@ -1327,6 +1327,103 @@ if _active == "📊 Reports":
             st.plotly_chart(px.bar(inc, x="month", y="amount", color="category"), use_container_width=True)
             st.dataframe(inc, use_container_width=True)
 
+        # ---- Portfolio value (mark-to-market from investment snapshots) ----
+        st.divider()
+        st.markdown("### 💼 Portfolio Value (mark-to-market)")
+        st.caption(
+            "Reports above are cash-flow P&L (money in/out). This section adds the current "
+            "mark-to-market value from the 💹 Investments tab snapshots — ULIP/MF fund values, "
+            "Dhan equity holdings and the Dhan ledger/margin balance — so you can see total "
+            "wealth, not just transactions. Record a new snapshot in the Investments tab to "
+            "update these numbers."
+        )
+        use_snapshots = st.toggle("Use Investment snapshots for current value", value=True, key="rep_use_inv")
+        if use_snapshots:
+            try:
+                with get_conn() as _conn:
+                    with _conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as _cur:
+                        _cur.execute("""
+                            SELECT DISTINCT ON (p.key)
+                                   p.key, p.label, p.insurer, p.policy_type,
+                                   p.total_invested, s.as_of_date, s.total_value, s.source
+                            FROM investment_policies p
+                            JOIN investment_value_snapshots s ON s.policy_key = p.key
+                            ORDER BY p.key, s.as_of_date DESC
+                        """)
+                        latest_snaps = _cur.fetchall()
+            except Exception as e:
+                st.error(f"Couldn't load investment snapshots: {e}")
+                latest_snaps = []
+
+            if not latest_snaps:
+                st.info("No investment snapshots recorded yet — add one in the 💹 Investments tab.")
+            else:
+                inv_df = pd.DataFrame(latest_snaps)
+                for col in ("total_invested", "total_value"):
+                    inv_df[col] = pd.to_numeric(inv_df[col], errors="coerce").fillna(0.0)
+
+                def bucket(policy_type: str, label: str) -> str:
+                    t = (policy_type or "").lower()
+                    l = label.lower()
+                    if "equity" in l or "etf" in l or "holdings" in l:
+                        return "Equity (Dhan)"
+                    if "ledger" in l or "margin" in l:
+                        return "Ledger / Margin Balance (Dhan)"
+                    if "pf" in l:
+                        return "Provident Fund"
+                    if "ulip" in t or "life" in t:
+                        return "ULIP / Insurance"
+                    return "Other"
+
+                inv_df["Bucket"] = inv_df.apply(
+                    lambda r: bucket(r.get("policy_type"), r.get("label") or ""), axis=1
+                )
+                inv_df["Gain"] = inv_df["total_value"] - inv_df["total_invested"]
+
+                # Headline numbers per bucket
+                by_bucket = inv_df.groupby("Bucket").agg(
+                    value=("total_value", "sum"), invested=("total_invested", "sum"),
+                ).reset_index()
+                by_bucket["Gain"] = by_bucket["value"] - by_bucket["invested"]
+
+                k1, k2, k3, k4 = st.columns(4)
+                eq_row = by_bucket[by_bucket["Bucket"].str.contains("Equity", case=False, na=False)]
+                led_row = by_bucket[by_bucket["Bucket"].str.contains("Ledger", case=False, na=False)]
+                k1.metric("Total Portfolio", f"₹{inv_df['total_value'].sum():,.0f}")
+                k2.metric("Equity (Dhan)", f"₹{(eq_row['value'].sum() if not eq_row.empty else 0):,.0f}")
+                k3.metric("Ledger / Margin (Dhan)", f"₹{(led_row['value'].sum() if not led_row.empty else 0):,.0f}")
+                k4.metric("Unrealised Gain", f"₹{inv_df['Gain'].sum():,.0f}")
+
+                st.markdown("#### Latest snapshot per policy")
+                show_df = inv_df[["label", "insurer", "policy_type", "Bucket",
+                                  "total_invested", "total_value", "Gain", "as_of_date", "source"]].rename(columns={
+                    "label": "Policy", "insurer": "Insurer", "policy_type": "Type",
+                    "total_invested": "Invested", "total_value": "Current Value",
+                    "as_of_date": "As of", "source": "Source",
+                }).sort_values("Bucket")
+                st.dataframe(
+                    show_df, use_container_width=True, hide_index=True,
+                    column_config={
+                        "Invested": st.column_config.NumberColumn("Invested", format="₹{:,.0f}"),
+                        "Current Value": st.column_config.NumberColumn("Current Value", format="₹{:,.0f}"),
+                        "Gain": st.column_config.NumberColumn("Gain", format="₹{:,.0f}"),
+                        "As of": st.column_config.DateColumn("As of"),
+                    },
+                )
+
+                st.markdown("#### By bucket")
+                bb = by_bucket.rename(columns={"value": "Current Value", "invested": "Invested"})
+                st.dataframe(
+                    bb, use_container_width=True, hide_index=True,
+                    column_config={
+                        "Current Value": st.column_config.NumberColumn("Current Value", format="₹{:,.0f}"),
+                        "Invested": st.column_config.NumberColumn("Invested", format="₹{:,.0f}"),
+                        "Gain": st.column_config.NumberColumn("Gain", format="₹{:,.0f}"),
+                    },
+                )
+        else:
+            st.caption("Toggle is off — showing cash-flow reports only (transactions table).")
+
 # -------------------------------------------------------- Trading tab -----
 if _active == "📈 Trading":
     df = load_df()
