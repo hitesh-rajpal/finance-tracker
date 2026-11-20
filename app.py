@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
+import psycopg2.extras
 import streamlit as st
 
 from core.storage import (
@@ -2020,16 +2021,35 @@ with tab_investments:
                "point-in-time snapshot you (or another tool via API) check and record periodically, "
                "not something derived from transactions.")
 
-    # Cache policies list
-    @st.cache_data(ttl=300)
-    def get_policies_cached():
-        return get_investment_policies()
+    # Initialize session state
+    if "inv_policies" not in st.session_state:
+        st.session_state.inv_policies = None
+    if "inv_snapshots" not in st.session_state:
+        st.session_state.inv_snapshots = None
+    if "inv_policies_loaded" not in st.session_state:
+        st.session_state.inv_policies_loaded = False
+    if "inv_snapshots_loaded" not in st.session_state:
+        st.session_state.inv_snapshots_loaded = False
 
-    policies = get_policies_cached()
-    policy_options = {p["label"]: p["key"] for p in policies}
+    # ----- Load Policies (on demand) -----
+    if not st.session_state.inv_policies_loaded:
+        st.info("👆 Click **'Load Policies'** to fetch your policies from the database.")
+        if st.button("📋 Load Policies", type="primary", use_container_width=True):
+            with st.spinner("Loading policies..."):
+                try:
+                    with get_conn() as _conn:
+                        with _conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as _cur:
+                            _cur.execute("SELECT * FROM investment_policies ORDER BY label")
+                            st.session_state.inv_policies = _cur.fetchall()
+                    st.session_state.inv_policies_loaded = True
+                except Exception as e:
+                    st.error(f"Database error: {e}")
+                st.rerun()
+    else:
+        policies = st.session_state.inv_policies
+        policy_options = {p["label"]: p["key"] for p in policies}
 
-    # Show policies immediately (no DB join)
-    if policies:
+        # Show policies
         st.markdown("### 📋 Your Policies")
         for p in policies:
             with st.expander(f"{p['label']} ({p.get('insurer','')})"):
@@ -2043,602 +2063,476 @@ with tab_investments:
                 c2.write(f"**Premiums Paid:** {p.get('premiums_paid',0)}/{p.get('total_premiums',0)}")
                 c2.write(f"**Maturity:** {p.get('maturity_date','-')}")
 
-    st.divider()
+        st.divider()
 
-    # ----- Cached data loading (on demand) -----
-    @st.cache_data(ttl=300)
-    def load_investment_data():
-        try:
-            with get_conn() as _conn:
-                with _conn.cursor() as _cur:
-                    _cur.execute("""
-                        SELECT s.id, p.label, s.as_of_date, s.total_value, s.source,
-                               f.fund_name, f.units, f.nav, f.value
-                        FROM investment_value_snapshots s
-                        JOIN investment_policies p ON p.key = s.policy_key
-                        LEFT JOIN investment_snapshot_funds f ON f.snapshot_id = s.id
-                        ORDER BY p.label, s.as_of_date, f.fund_name
-                    """)
-                    snap_data = _cur.fetchall()
-                    _cur.execute("SELECT * FROM investment_policies ORDER BY label")
-                    pol_data = _cur.fetchall()
-            return snap_data, pol_data
-        except Exception as e:
-            st.error(f"Database error: {e}")
-            return [], []
-
-    # Load data ON DEMAND with button
-    col_load, col_clear = st.columns([1, 4])
-    if col_load.button("🔄 Load Investment Snapshots", type="primary", use_container_width=True):
-        with st.spinner("Loading investment snapshots from database..."):
-            _all_snap_data, _all_policies = load_investment_data()
-        st.session_state["inv_data_loaded"] = True
-        st.session_state["_all_snap_data"] = _all_snap_data
-        st.session_state["_all_policies"] = _all_policies
-        st.rerun()
-
-    if col_clear.button("Clear Data", use_container_width=True):
-        if "inv_data_loaded" in st.session_state:
-            del st.session_state["inv_data_loaded"]
-            del st.session_state["_all_snap_data"]
-            del st.session_state["_all_policies"]
-        st.rerun()
-
-    # Show data if loaded
-    _all_snap_data = st.session_state.get("_all_snap_data", [])
-    _all_policies = st.session_state.get("_all_policies", [])
-
-    if not _all_snap_data:
-        if st.session_state.get("inv_data_loaded"):
-            st.info("No investment snapshots found. Add a policy and snapshot first using the forms below.")
+        # ----- Load Snapshots (on demand) -----
+        if not st.session_state.inv_snapshots_loaded:
+            st.info("👆 Click **'Load Snapshots'** to fetch investment snapshots from the database.")
+            if st.button("🔄 Load Snapshots", type="primary", use_container_width=True):
+                with st.spinner("Loading investment snapshots..."):
+                    try:
+                        with get_conn() as _conn:
+                            with _conn.cursor() as _cur:
+                                _cur.execute("""
+                                    SELECT s.id, p.label, s.as_of_date, s.total_value, s.source,
+                                           f.fund_name, f.units, f.nav, f.value
+                                    FROM investment_value_snapshots s
+                                    JOIN investment_policies p ON p.key = s.policy_key
+                                    LEFT JOIN investment_snapshot_funds f ON f.snapshot_id = s.id
+                                    ORDER BY p.label, s.as_of_date, f.fund_name
+                                """)
+                                snap_data = _cur.fetchall()
+                                _cur.execute("SELECT * FROM investment_policies ORDER BY label")
+                                pol_data = _cur.fetchall()
+                        st.session_state.inv_snapshots = snap_data
+                        st.session_state.inv_policies = pol_data  # refresh policies too
+                        st.session_state.inv_snapshots_loaded = True
+                    except Exception as e:
+                        st.error(f"Database error: {e}")
+                    st.rerun()
         else:
-            st.info("👆 Click **'Load Investment Snapshots'** to fetch your data from the database.")
-    else:
-        hist_df = pd.DataFrame(_all_snap_data, columns=["id", "label", "as_of_date", "total_value", "source",
-                                                         "fund_name", "units", "nav", "value"])
-        hist_df["as_of_date"] = pd.to_datetime(hist_df["as_of_date"])
-        hist_df["total_value"] = hist_df["total_value"].astype(float)
-
-        # Date range selector
-        min_date = hist_df["as_of_date"].min().date()
-        max_date = hist_df["as_of_date"].max().date()
-        c1, c2 = st.columns(2)
-        start_date = c1.date_input("Start Date", min_date, min_value=min_date, max_value=max_date, key="inv_start_date")
-        end_date = c2.date_input("End Date", max_date, min_value=min_date, max_value=max_date, key="inv_end_date")
-
-        # Filter data by date range
-        mask = (hist_df["as_of_date"].dt.date >= start_date) & (hist_df["as_of_date"].dt.date <= end_date)
-        filtered_df = hist_df[mask].copy()
-
-        # ---- Date Range Comparison View ----
-        st.markdown("#### 📊 Date Range Comparison")
-        if len(filtered_df) > 0:
-            # Policy-wise comparison
-            policy_comparison = filtered_df.groupby("label").agg(
-                first_date=("as_of_date", "min"),
-                last_date=("as_of_date", "max"),
-                first_value=("total_value", "first"),
-                last_value=("total_value", "last"),
-                snapshots=("total_value", "count"),
-            ).reset_index()
-            policy_comparison["change"] = policy_comparison["last_value"] - policy_comparison["first_value"]
-            policy_comparison["change_pct"] = (
-                (policy_comparison["change"] / policy_comparison["first_value"]) * 100
-            ).round(2)
-
-            st.dataframe(
-                policy_comparison,
-                use_container_width=True, hide_index=True,
-                column_config={
-                    "label": "Policy",
-                    "first_date": st.column_config.DateColumn("First Date"),
-                    "last_date": st.column_config.DateColumn("Last Date"),
-                    "first_value": st.column_config.NumberColumn("First Value", format="₹{:,.2f}"),
-                    "last_value": st.column_config.NumberColumn("Last Value", format="₹{:,.2f}"),
-                    "snapshots": "Snapshots",
-                    "change": st.column_config.NumberColumn("Change (₹)", format="₹{:,.2f}"),
-                    "change_pct": st.column_config.NumberColumn("Change (%)", format="{:+.2f}%"),
-                }
-            )
-
-            # Combined portfolio comparison
-            st.markdown("#### 📈 Combined Portfolio Comparison")
-            wide = filtered_df.pivot_table(
-                index="as_of_date", columns="label", values="total_value", aggfunc="sum"
-            ).sort_index()
-            filled = wide.ffill()
-            combined = filled.sum(axis=1).rename("combined_total").reset_index()
-            combined.columns = ["Date", "Combined Value"]
-            combined["Change"] = combined["Combined Value"].diff()
-            combined["Change %"] = combined["Combined Value"].pct_change() * 100
-
-            st.line_chart(
-                combined.set_index("Date")["Combined Value"],
-                use_container_width=True,
-            )
-            st.dataframe(
-                combined,
-                use_container_width=True, hide_index=True,
-                column_config={
-                    "Date": st.column_config.DateColumn("Date"),
-                    "Combined Value": st.column_config.NumberColumn("Combined Value", format="₹{:,.2f}"),
-                    "Change": st.column_config.NumberColumn("Change (₹)", format="₹{:,.2f}"),
-                    "Change %": st.column_config.NumberColumn("Change (%)", format="{:+.2f}%"),
-                }
-            )
-
-            # Fund-level comparison
-            st.markdown("#### 💰 Fund-Level Comparison")
-            fund_comparison = filtered_df[filtered_df["fund_name"].notna()].groupby(
-                ["label", "fund_name"]
-            ).agg(
-                first_date=("as_of_date", "min"),
-                last_date=("as_of_date", "max"),
-                first_value=("value", "first"),
-                last_value=("value", "last"),
-                first_units=("units", "first"),
-                last_units=("units", "last"),
-                first_nav=("nav", "first"),
-                last_nav=("nav", "last"),
-            ).reset_index()
-            fund_comparison["value_change"] = fund_comparison["last_value"] - fund_comparison["first_value"]
-            fund_comparison["units_change"] = fund_comparison["last_units"] - fund_comparison["first_units"]
-            fund_comparison["nav_change"] = fund_comparison["last_nav"] - fund_comparison["first_nav"]
-
-            st.dataframe(
-                fund_comparison,
-                use_container_width=True, hide_index=True,
-                column_config={
-                    "label": "Policy",
-                    "fund_name": "Fund",
-                    "first_date": st.column_config.DateColumn("First Date"),
-                    "last_date": st.column_config.DateColumn("Last Date"),
-                    "first_value": st.column_config.NumberColumn("First Value", format="₹{:,.2f}"),
-                    "last_value": st.column_config.NumberColumn("Last Value", format="₹{:,.2f}"),
-                    "value_change": st.column_config.NumberColumn("Value Change (₹)", format="₹{:,.2f}"),
-                    "first_units": st.column_config.NumberColumn("First Units", format="{:,.4f}"),
-                    "last_units": st.column_config.NumberColumn("Last Units", format="{:,.4f}"),
-                    "units_change": st.column_config.NumberColumn("Units Change", format="{:+.4f}"),
-                    "first_nav": st.column_config.NumberColumn("First NAV", format="{:.4f}"),
-                    "last_nav": st.column_config.NumberColumn("Last NAV", format="{:.4f}"),
-                    "nav_change": st.column_config.NumberColumn("NAV Change", format="{:+.4f}"),
-                }
-            )
-
-        # ----- Excel Export (all data, multi-sheet) -----
-        if policies:
-            import io
-            import openpyxl
-            from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-            from openpyxl.utils import get_column_letter
-
-            wb = openpyxl.Workbook()
-
-            # Style helpers
-            header_font = Font(bold=True, color="FFFFFF")
-            header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-            header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            thin_border = Border(
-                left=Side(style='thin'), right=Side(style='thin'),
-                top=Side(style='thin'), bottom=Side(style='thin')
-            )
-            currency_fmt = '#,##0.00'
-            pct_fmt = '0.00%'
-
-            def style_header(ws, row, max_col):
-                for col in range(1, max_col + 1):
-                    cell = ws.cell(row=row, column=col)
-                    cell.font = header_font
-                    cell.fill = header_fill
-                    cell.alignment = header_align
-                    cell.border = thin_border
-
-            def style_data(ws, start_row, end_row, max_col):
-                for r in range(start_row, end_row + 1):
-                    for c in range(1, max_col + 1):
-                        cell = ws.cell(row=r, column=c)
-                        cell.border = thin_border
-                        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-            def auto_width(ws, min_width=10, max_width=40):
-                for col in ws.columns:
-                    max_len = 0
-                    col_letter = get_column_letter(col[0].column)
-                    for cell in col:
-                        try:
-                            if cell.value:
-                                max_len = max(max_len, len(str(cell.value)))
-                        except:
-                            pass
-                    ws.column_dimensions[col_letter].width = min(max(max_len + 2, min_width), max_width)
-
-            # ---- Sheet 1: Policies Master ----
-            ws1 = wb.active
-            ws1.title = "Policies Master"
-            headers1 = ["Key", "Label", "Insurer", "Policy No.", "Type", "Premium (₹)", "Frequency",
-                        "Next Premium Due", "Sum Assured (₹)", "Total Invested (₹)",
-                        "Premiums Paid", "Total Premiums", "Maturity Date",
-                        "Auto-debit Set Up", "Policy Holder", "Nominee"]
-            for c, h in enumerate(headers1, 1):
-                ws1.cell(row=1, column=c, value=h)
-            style_header(ws1, 1, len(headers1))
-            for r, p in enumerate(_all_policies, 2):
-                ws1.cell(row=r, column=1, value=p["key"])
-                ws1.cell(row=r, column=2, value=p["label"])
-                ws1.cell(row=r, column=3, value=p["insurer"])
-                ws1.cell(row=r, column=4, value=p["policy_no"])
-                ws1.cell(row=r, column=5, value=p["policy_type"])
-                ws1.cell(row=r, column=6, value=p["premium_amount"])
-                ws1.cell(row=r, column=7, value=p["premium_frequency"])
-                ws1.cell(row=r, column=8, value=p["next_premium_due"])
-                ws1.cell(row=r, column=9, value=p["sum_assured"])
-                ws1.cell(row=r, column=10, value=p["total_invested"])
-                ws1.cell(row=r, column=11, value=p["premiums_paid"])
-                ws1.cell(row=r, column=12, value=p["total_premiums"])
-                ws1.cell(row=r, column=13, value=p["maturity_date"])
-                auto_debit_map = {True: "Yes", False: "No", None: "Unknown"}
-                ws1.cell(row=r, column=14, value=auto_debit_map.get(p["auto_debit_set_up"]))
-                ws1.cell(row=r, column=15, value=p["policy_holder"])
-                ws1.cell(row=r, column=16, value=p["nominee"])
-            style_data(ws1, 2, len(_all_policies) + 1, len(headers1))
-            auto_width(ws1)
-
-            # ---- Sheet 2: All Snapshots (raw) ----
-            ws2 = wb.create_sheet("All Snapshots")
-            headers2 = ["Snapshot ID", "Policy", "As of Date", "Total Value (₹)", "Source",
-                        "Fund Name", "Units", "NAV", "Fund Value (₹)"]
-            for c, h in enumerate(headers2, 1):
-                ws2.cell(row=1, column=c, value=h)
-            style_header(ws2, 1, len(headers2))
-            for r, snap in enumerate(_all_snap_data, 2):
-                ws2.cell(row=r, column=1, value=snap["id"])
-                ws2.cell(row=r, column=2, value=snap["label"])
-                ws2.cell(row=r, column=3, value=snap["as_of_date"])
-                ws2.cell(row=r, column=4, value=snap["total_value"])
-                ws2.cell(row=r, column=5, value=snap["source"])
-                ws2.cell(row=r, column=6, value=snap["fund_name"])
-                ws2.cell(row=r, column=7, value=snap["units"])
-                ws2.cell(row=r, column=8, value=snap["nav"])
-                ws2.cell(row=r, column=9, value=snap["value"])
-            style_data(ws2, 2, len(_all_snap_data) + 1, len(headers2))
-            auto_width(ws2)
-
-            # ---- Sheet 3: Policy-wise History (combined per policy) ----
-            ws3 = wb.create_sheet("Policy History")
-            headers3 = ["Policy", "As of Date", "Total Value (₹)", "Source", "# Funds Updated"]
-            for c, h in enumerate(headers3, 1):
-                ws3.cell(row=1, column=c, value=h)
-            style_header(ws3, 1, len(headers3))
+            # Show loaded data
+            snap_data = st.session_state.inv_snapshots
+            policies = st.session_state.inv_policies
             
-            # Build policy history from snapshots
-            policy_hist = {}
-            for snap in _all_snap_data:
-                label = snap["label"]
-                policy_hist.setdefault(label, []).append(snap)
-            
-            row = 2
-            for label in sorted(policy_hist):
-                snaps = policy_hist[label]
-                snaps.sort(key=lambda x: x["as_of_date"])
-                for s in snaps:
-                    # Count funds for this snapshot
-                    fund_count = sum(1 for x in _all_snap_data if x["id"] == s["id"] and x["fund_name"])
-                    ws3.cell(row=row, column=1, value=label)
-                    ws3.cell(row=row, column=2, value=s["as_of_date"])
-                    ws3.cell(row=row, column=3, value=s["total_value"])
-                    ws3.cell(row=row, column=4, value=s["source"])
-                    ws3.cell(row=row, column=5, value=fund_count)
-                    row += 1
-            style_data(ws3, 2, row - 1, len(headers3))
-            auto_width(ws3)
-
-            # ---- Sheet 4: Latest Fund Breakdown per Policy ----
-            ws4 = wb.create_sheet("Latest Fund Breakdown")
-            headers4 = ["Policy", "As of Date", "Fund Name", "Units", "NAV", "Value (₹)"]
-            for c, h in enumerate(headers4, 1):
-                ws4.cell(row=1, column=c, value=h)
-            style_header(ws4, 1, len(headers4))
-            row = 2
-            for label in sorted(policy_hist):
-                latest_snap = policy_hist[label][-1]  # most recent
-                latest_funds = [x for x in _all_snap_data if x["id"] == latest_snap["id"] and x["fund_name"]]
-                for f in latest_funds:
-                    ws4.cell(row=row, column=1, value=label)
-                    ws4.cell(row=row, column=2, value=latest_snap["as_of_date"])
-                    ws4.cell(row=row, column=3, value=f["fund_name"])
-                    ws4.cell(row=row, column=4, value=f["units"])
-                    ws4.cell(row=row, column=5, value=f["nav"])
-                    ws4.cell(row=row, column=6, value=f["value"])
-                    row += 1
-            style_data(ws4, 2, row - 1, len(headers4))
-            auto_width(ws4)
-
-            # ---- Sheet 5: Combined Portfolio Timeline ----
-            ws5 = wb.create_sheet("Combined Portfolio")
-            headers5 = ["As of Date", "Combined Total (₹)", "Policies Updated", "Policies Total", "Change (₹)", "Change %"]
-            for c, h in enumerate(headers5, 1):
-                ws5.cell(row=1, column=c, value=h)
-            style_header(ws5, 1, len(headers5))
-            
-            # Rebuild combined timeline
-            import pandas as pd
-            hist_df = pd.DataFrame(_all_snap_data, columns=["id", "label", "as_of_date", "total_value", "source",
+            if not snap_data:
+                st.info("No investment snapshots found. Add a policy and snapshot first using the forms below.")
+            else:
+                hist_df = pd.DataFrame(snap_data, columns=["id", "label", "as_of_date", "total_value", "source",
                                                              "fund_name", "units", "nav", "value"])
-            hist_df["as_of_date"] = pd.to_datetime(hist_df["as_of_date"])
-            hist_df["total_value"] = hist_df["total_value"].astype(float)
-            wide = hist_df.pivot_table(index="as_of_date", columns="label", values="total_value", aggfunc="sum").sort_index()
-            filled = wide.ffill()
-            updated_counts = hist_df.groupby("as_of_date")["label"].nunique()
-            combined = filled.sum(axis=1).rename("combined_total").reset_index()
-            combined["policies_updated"] = combined["as_of_date"].map(updated_counts).fillna(0).astype(int)
-            combined["policies_total"] = filled.notna().sum(axis=1).values
-            combined["change"] = combined["combined_total"].diff()
-            combined["change_pct"] = combined["combined_total"].pct_change()
-            
-            for r, (_, c_row) in enumerate(combined.iterrows(), 2):
-                ws5.cell(row=r, column=1, value=c_row["as_of_date"].strftime("%Y-%m-%d"))
-                ws5.cell(row=r, column=2, value=round(c_row["combined_total"], 2))
-                ws5.cell(row=r, column=3, value=int(c_row["policies_updated"]))
-                ws5.cell(row=r, column=4, value=int(c_row["policies_total"]))
-                ws5.cell(row=r, column=5, value=round(c_row["change"], 2) if pd.notna(c_row["change"]) else "")
-                ws5.cell(row=r, column=6, value=round(c_row["change_pct"], 4) if pd.notna(c_row["change_pct"]) else "")
-            style_data(ws5, 2, len(combined) + 1, len(headers5))
-            auto_width(ws5)
-
-            # ---- Sheet 6: Policy Gains (if total_invested tracked) ----
-            ws6 = wb.create_sheet("Policy Gains")
-            headers6 = ["Policy", "Total Invested (₹)", "Latest Value (₹)", "As of Date", "Gain (₹)", "Gain %"]
-            for c, h in enumerate(headers6, 1):
-                ws6.cell(row=1, column=c, value=h)
-            style_header(ws6, 1, len(headers6))
-            row = 2
-            for p in _all_policies:
-                if p["total_invested"]:
-                    # Find latest snapshot for this policy
-                    p_snaps = [x for x in _all_snap_data if x["label"] == p["label"]]
-                    if p_snaps:
-                        latest = max(p_snaps, key=lambda x: x["as_of_date"])
-                        gain = latest["total_value"] - p["total_invested"]
-                        gain_pct = gain / p["total_invested"]
-                        ws6.cell(row=row, column=1, value=p["label"])
-                        ws6.cell(row=row, column=2, value=p["total_invested"])
-                        ws6.cell(row=row, column=3, value=latest["total_value"])
-                        ws6.cell(row=row, column=4, value=latest["as_of_date"])
-                        ws6.cell(row=row, column=5, value=round(gain, 2))
-                        ws6.cell(row=row, column=6, value=round(gain_pct, 4))
-                        row += 1
-            style_data(ws6, 2, row - 1, len(headers6))
-            auto_width(ws6)
-
-            # Save to bytes
-            output = io.BytesIO()
-            wb.save(output)
-            output.seek(0)
-            xlsx_bytes = output.read()
-
-            # Download button
-            st.download_button(
-                label="📥 Export All Investment Data to Excel (6 sheets)",
-                data=xlsx_bytes,
-                file_name=f"investments_export_{date.today().isoformat()}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-            st.caption("Sheets: Policies Master | All Snapshots (raw) | Policy History | Latest Fund Breakdown | Combined Portfolio | Policy Gains")
-
-        if policies:
-            with get_conn() as _conn:
-                with _conn.cursor() as _cur:
-                    _cur.execute("""
-                        SELECT p.label, s.as_of_date, s.total_value
-                        FROM investment_value_snapshots s
-                        JOIN investment_policies p ON p.key = s.policy_key
-                        ORDER BY s.as_of_date
-                    """)
-                    _all_snaps = _cur.fetchall()
-
-            if _all_snaps:
-                hist_df = pd.DataFrame(_all_snaps, columns=["label", "as_of_date", "total_value"])
+                hist_df["as_of_date"] = pd.to_datetime(hist_df["as_of_date"])
                 hist_df["total_value"] = hist_df["total_value"].astype(float)
 
-                # A policy only gets a new value when you record a snapshot, so a
-                # date where just one or two policies were updated must not make
-                # the others disappear from the total. Carry each policy's latest
-                # value forward, then sum — so the line shows the whole portfolio
-                # as of each date, not just whatever was entered that day.
-                wide = hist_df.pivot_table(
-                    index="as_of_date", columns="label", values="total_value", aggfunc="sum",
-                ).sort_index()
-                filled = wide.ffill()
-                updated_counts = hist_df.groupby("as_of_date")["label"].nunique()
-                combined = filled.sum(axis=1).rename("combined_total").reset_index()
-                combined["policies_updated"] = (
-                    combined["as_of_date"].map(updated_counts).fillna(0).astype(int)
-                )
-                combined["policies_total"] = filled.notna().sum(axis=1).values
+                # Date range selector
+                min_date = hist_df["as_of_date"].min().date()
+                max_date = hist_df["as_of_date"].max().date()
+                c1, c2 = st.columns(2)
+                start_date = c1.date_input("Start Date", min_date, min_value=min_date, max_value=max_date, key="inv_start_date")
+                end_date = c2.date_input("End Date", max_date, min_value=min_date, max_value=max_date, key="inv_end_date")
 
-                st.markdown("### 📊 Portfolio overview")
-                latest_date = combined["as_of_date"].max()
-                latest_total = combined.loc[combined["as_of_date"] == latest_date, "combined_total"].iloc[0]
-                peak_row = combined.loc[combined["combined_total"].idxmax()]
-                latest_row = combined.iloc[-1]
+                # Filter data by date range
+                mask = (hist_df["as_of_date"].dt.date >= start_date) & (hist_df["as_of_date"].dt.date <= end_date)
+                filtered_df = hist_df[mask].copy()
 
-                mc1, mc2, mc3 = st.columns(3)
-                mc1.metric(f"Combined value (as of {latest_date})", f"₹{latest_total:,.2f}")
-                mc2.metric("All-time combined peak", f"₹{peak_row['combined_total']:,.2f}",
-                           help=f"Reached on {peak_row['as_of_date']}")
-                if len(combined) > 1:
-                    prev_total = combined["combined_total"].iloc[-2]
-                    mc3.metric("Change since prior check", f"₹{latest_total - prev_total:,.2f}",
-                               delta=f"{(latest_total - prev_total) / prev_total * 100:.2f}%",
-                               help="Includes any policy added since the previous check.")
+                # ---- Date Range Comparison View ----
+                st.markdown("#### 📊 Date Range Comparison")
+                if len(filtered_df) > 0:
+                    # Policy-wise comparison
+                    policy_comparison = filtered_df.groupby("label").agg(
+                        first_date=("as_of_date", "min"),
+                        last_date=("as_of_date", "max"),
+                        first_value=("total_value", "first"),
+                        last_value=("total_value", "last"),
+                        snapshots=("total_value", "count"),
+                    ).reset_index()
+                    policy_comparison["change"] = policy_comparison["last_value"] - policy_comparison["first_value"]
+                    policy_comparison["change_pct"] = (
+                        (policy_comparison["change"] / policy_comparison["first_value"]) * 100
+                    ).round(2)
 
-                st.caption(
-                    f"Each policy keeps its most recent recorded value until a new snapshot replaces it. "
-                    f"On {latest_date}, {latest_row['policies_updated']} of "
-                    f"{latest_row['policies_total']} policies were updated; the rest are carried forward."
-                )
-
-                st.plotly_chart(
-                    px.line(combined, x="as_of_date", y="combined_total", markers=True,
-                            labels={"as_of_date": "Date", "combined_total": "Combined value (₹)"},
-                            title="Combined portfolio value over time"),
-                    use_container_width=True,
-                )
-
-                st.markdown("#### Date-by-date comparison")
-                compare = combined.copy()
-                compare["change"] = compare["combined_total"].diff()
-                compare["change_pct"] = compare["combined_total"].pct_change() * 100
-                st.dataframe(compare.style.format({
-                    "combined_total": "₹{:,.2f}", "change": "₹{:,.2f}", "change_pct": "{:+.2f}%",
-                }), use_container_width=True)
-                st.caption("`policies_updated` is how many policies got a fresh snapshot that date; "
-                           "the rest carried their previous value into the total.")
-
-                st.markdown("#### Latest value per policy")
-                latest_per_policy = (
-                    hist_df.sort_values("as_of_date").groupby("label").tail(1)
-                    .sort_values("total_value", ascending=False)
-                )
-                st.dataframe(
-                    latest_per_policy.rename(columns={
-                        "label": "Policy", "as_of_date": "As of", "total_value": "Value",
-                    }).style.format({"Value": "₹{:,.2f}"}),
-                    use_container_width=True,
-                )
-                stale = latest_per_policy[latest_per_policy["as_of_date"] < latest_date]
-                if len(stale):
-                    st.caption(
-                        "Not updated on the latest date (carried forward): "
-                        + ", ".join(stale["label"].tolist())
+                    st.dataframe(
+                        policy_comparison,
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            "label": "Policy",
+                            "first_date": st.column_config.DateColumn("First Date"),
+                            "last_date": st.column_config.DateColumn("Last Date"),
+                            "first_value": st.column_config.NumberColumn("First Value", format="₹{:,.2f}"),
+                            "last_value": st.column_config.NumberColumn("Last Value", format="₹{:,.2f}"),
+                            "snapshots": "Snapshots",
+                            "change": st.column_config.NumberColumn("Change (₹)", format="₹{:,.2f}"),
+                            "change_pct": st.column_config.NumberColumn("Change (%)", format="{:+.2f}%"),
+                        }
                     )
 
-                st.markdown("#### Highest value per policy, and when")
-                per_policy_peak = hist_df.loc[hist_df.groupby("label")["total_value"].idxmax()]
-                per_policy_peak = per_policy_peak.sort_values("total_value", ascending=False)
-                st.dataframe(
-                    per_policy_peak.rename(columns={"label": "Policy", "as_of_date": "Date of peak",
-                                                     "total_value": "Peak value"})
-                                   .style.format({"Peak value": "₹{:,.2f}"}),
-                    use_container_width=True,
-                )
-            st.divider()
+                    # Combined portfolio comparison
+                    st.markdown("#### 📈 Combined Portfolio Comparison")
+                    wide = filtered_df.pivot_table(
+                        index="as_of_date", columns="label", values="total_value", aggfunc="sum"
+                    ).sort_index()
+                    filled = wide.ffill()
+                    combined = filled.sum(axis=1).rename("combined_total").reset_index()
+                    combined.columns = ["Date", "Combined Value"]
+                    combined["Change"] = combined["Combined Value"].diff()
+                    combined["Change %"] = combined["Combined Value"].pct_change() * 100
 
-        with st.expander("➕ Add / update a policy", expanded=not policies):
-            c1, c2, c3 = st.columns(3)
-            p_label = c1.text_input("Label", placeholder="e.g. IndusInd Nippon Life Premier (ULIP)")
-            p_insurer = c2.text_input("Insurer", placeholder="e.g. IndusInd Nippon")
-            p_policy_no = c3.text_input("Policy No.")
-            c4, c5, c6, c7 = st.columns(4)
-            p_type = c4.text_input("Type", value="ULIP")
-            p_premium = c5.number_input("Premium (₹)", min_value=0.0, step=1000.0)
-            p_freq = c6.selectbox("Premium frequency", ["Yearly", "Half-Yearly", "Quarterly", "Monthly"])
-            p_due = c7.date_input("Next premium due", value=None)
-            c8, c9, c10, c11 = st.columns(4)
-            p_sum_assured = c8.number_input("Sum assured (₹)", min_value=0.0, step=10000.0)
-            p_total_invested = c9.number_input("Total invested so far (₹)", min_value=0.0, step=10000.0)
-            p_premiums_paid = c10.number_input("Premiums paid", min_value=0, step=1)
-            p_total_premiums = c11.number_input("Total premiums (policy term)", min_value=0, step=1)
-            c12, c13, c14, c15 = st.columns(4)
-            p_maturity = c12.date_input("Maturity date", value=None)
-            p_auto_debit = c13.selectbox("Auto-debit (SI/ECS) set up?", ["Unknown", "Yes", "No"])
-            p_holder = c14.text_input("Policy holder", placeholder="e.g. Hitesh Rajpal")
-            p_nominee = c15.text_input("Nominee", placeholder="e.g. Manisha Rajpal")
-            if st.button("Save policy"):
-                if not p_label:
-                    st.error("Give it a label first.")
-                else:
-                    key = re.sub(r"[^a-z0-9]+", "_", p_label.lower()).strip("_")
-                    save_investment_policy(
-                        key, p_label, insurer=p_insurer or None, policy_no=p_policy_no or None,
-                        policy_type=p_type or None, premium_amount=p_premium or None,
-                        premium_frequency=p_freq, next_premium_due=p_due.isoformat() if p_due else None,
-                        sum_assured=p_sum_assured or None, total_invested=p_total_invested or None,
-                        premiums_paid=p_premiums_paid or None, total_premiums=p_total_premiums or None,
-                        maturity_date=p_maturity.isoformat() if p_maturity else None,
-                        auto_debit_set_up={"Yes": True, "No": False, "Unknown": None}[p_auto_debit],
-                        policy_holder=p_holder or None, nominee=p_nominee or None,
+                    st.line_chart(
+                        combined.set_index("Date")["Combined Value"],
+                        use_container_width=True,
                     )
-                    st.success(f"Saved '{p_label}'.")
-                    st.rerun()
+                    st.dataframe(
+                        combined,
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            "Date": st.column_config.DateColumn("Date"),
+                            "Combined Value": st.column_config.NumberColumn("Combined Value", format="₹{:,.2f}"),
+                            "Change": st.column_config.NumberColumn("Change (₹)", format="₹{:,.2f}"),
+                            "Change %": st.column_config.NumberColumn("Change (%)", format="{:+.2f}%"),
+                        }
+                    )
 
-        st.divider()
-        if not policies:
-            st.info("No policies yet — add one above.")
-        else:
-            sel_label = st.selectbox("Policy", list(policy_options.keys()))
-            policy = next(p for p in policies if p["label"] == sel_label)
-            key = policy["key"]
+                    # Fund-level comparison
+                    st.markdown("#### 💰 Fund-Level Comparison")
+                    fund_comparison = filtered_df[filtered_df["fund_name"].notna()].groupby(
+                        ["label", "fund_name"]
+                    ).agg(
+                        first_date=("as_of_date", "min"),
+                        last_date=("as_of_date", "max"),
+                        first_value=("value", "first"),
+                        last_value=("value", "last"),
+                        first_units=("units", "first"),
+                        last_units=("units", "last"),
+                        first_nav=("nav", "first"),
+                        last_nav=("nav", "last"),
+                    ).reset_index()
+                    fund_comparison["value_change"] = fund_comparison["last_value"] - fund_comparison["first_value"]
+                    fund_comparison["units_change"] = fund_comparison["last_units"] - fund_comparison["first_units"]
+                    fund_comparison["nav_change"] = fund_comparison["last_nav"] - fund_comparison["first_nav"]
 
-            holder_bits = []
-            if policy["policy_holder"]:
-                holder_bits.append(f"Holder: **{policy['policy_holder']}**")
-            if policy["nominee"]:
-                holder_bits.append(f"Nominee: **{policy['nominee']}**")
-            if policy["policy_no"]:
-                holder_bits.append(f"Policy No. **{policy['policy_no']}**")
-            if holder_bits:
-                st.caption(" | ".join(holder_bits))
+                    st.dataframe(
+                        fund_comparison,
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            "label": "Policy",
+                            "fund_name": "Fund",
+                            "first_date": st.column_config.DateColumn("First Date"),
+                            "last_date": st.column_config.DateColumn("Last Date"),
+                            "first_value": st.column_config.NumberColumn("First Value", format="₹{:,.2f}"),
+                            "last_value": st.column_config.NumberColumn("Last Value", format="₹{:,.2f}"),
+                            "value_change": st.column_config.NumberColumn("Value Change (₹)", format="₹{:,.2f}"),
+                            "first_units": st.column_config.NumberColumn("First Units", format="{:,.4f}"),
+                            "last_units": st.column_config.NumberColumn("Last Units", format="{:,.4f}"),
+                            "units_change": st.column_config.NumberColumn("Units Change", format="{:+.4f}"),
+                            "first_nav": st.column_config.NumberColumn("First NAV", format="{:.4f}"),
+                            "last_nav": st.column_config.NumberColumn("Last NAV", format="{:.4f}"),
+                            "nav_change": st.column_config.NumberColumn("NAV Change", format="{:+.4f}"),
+                        }
+                    )
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Premium", f"₹{policy['premium_amount']:,.0f} / {policy['premium_frequency']}"
-                       if policy["premium_amount"] else "—")
-            c2.metric("Next due", str(policy["next_premium_due"]) if policy["next_premium_due"] else "—")
-            c3.metric("Sum assured", f"₹{policy['sum_assured']:,.0f}" if policy["sum_assured"] else "—")
-            if policy["premiums_paid"] is not None and policy["total_premiums"]:
-                c4.metric("Premiums paid", f"{policy['premiums_paid']} of {policy['total_premiums']}")
+                # ----- Excel Export (all data, multi-sheet) -----
+                if policies:
+                    import io
+                    import openpyxl
+                    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+                    from openpyxl.utils import get_column_letter
+
+                    wb = openpyxl.Workbook()
+
+                    # Style helpers
+                    header_font = Font(bold=True, color="FFFFFF")
+                    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+                    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                    thin_border = Border(
+                        left=Side(style='thin'), right=Side(style='thin'),
+                        top=Side(style='thin'), bottom=Side(style='thin')
+                    )
+                    currency_fmt = '#,##0.00'
+                    pct_fmt = '0.00%'
+
+                    def style_header(ws, row, max_col):
+                        for col in range(1, max_col + 1):
+                            cell = ws.cell(row=row, column=col)
+                            cell.font = header_font
+                            cell.fill = header_fill
+                            cell.alignment = header_align
+                            cell.border = thin_border
+
+                    def style_data(ws, start_row, end_row, max_col):
+                        for r in range(start_row, end_row + 1):
+                            for c in range(1, max_col + 1):
+                                cell = ws.cell(row=r, column=c)
+                                cell.border = thin_border
+                                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+                    def auto_width(ws, min_width=10, max_width=40):
+                        for col in ws.columns:
+                            max_len = 0
+                            col_letter = get_column_letter(col[0].column)
+                            for cell in col:
+                                try:
+                                    if cell.value:
+                                        max_len = max(max_len, len(str(cell.value)))
+                                except:
+                                    pass
+                            ws.column_dimensions[col_letter].width = min(max(max_len + 2, min_width), max_width)
+
+                    # ---- Sheet 1: Policies Master ----
+                    ws1 = wb.active
+                    ws1.title = "Policies Master"
+                    headers1 = ["Key", "Label", "Insurer", "Policy No.", "Type", "Premium (₹)", "Frequency",
+                                "Next Premium Due", "Sum Assured (₹)", "Total Invested (₹)",
+                                "Premiums Paid", "Total Premiums", "Maturity Date",
+                                "Auto-debit Set Up", "Policy Holder", "Nominee"]
+                    for c, h in enumerate(headers1, 1):
+                        ws1.cell(row=1, column=c, value=h)
+                    style_header(ws1, 1, len(headers1))
+                    for r, p in enumerate(policies, 2):
+                        ws1.cell(row=r, column=1, value=p["key"])
+                        ws1.cell(row=r, column=2, value=p["label"])
+                        ws1.cell(row=r, column=3, value=p["insurer"])
+                        ws1.cell(row=r, column=4, value=p["policy_no"])
+                        ws1.cell(row=r, column=5, value=p["policy_type"])
+                        ws1.cell(row=r, column=6, value=p["premium_amount"])
+                        ws1.cell(row=r, column=7, value=p["premium_frequency"])
+                        ws1.cell(row=r, column=8, value=p["next_premium_due"])
+                        ws1.cell(row=r, column=9, value=p["sum_assured"])
+                        ws1.cell(row=r, column=10, value=p["total_invested"])
+                        ws1.cell(row=r, column=11, value=p["premiums_paid"])
+                        ws1.cell(row=r, column=12, value=p["total_premiums"])
+                        ws1.cell(row=r, column=13, value=p["maturity_date"])
+                        auto_debit_map = {True: "Yes", False: "No", None: "Unknown"}
+                        ws1.cell(row=r, column=14, value=auto_debit_map.get(p["auto_debit_set_up"]))
+                        ws1.cell(row=r, column=15, value=p["policy_holder"])
+                        ws1.cell(row=r, column=16, value=p["nominee"])
+                    style_data(ws1, 2, len(policies) + 1, len(headers1))
+                    auto_width(ws1)
+
+                    # ---- Sheet 2: All Snapshots (raw) ----
+                    ws2 = wb.create_sheet("All Snapshots")
+                    headers2 = ["Snapshot ID", "Policy", "As of Date", "Total Value (₹)", "Source",
+                                "Fund Name", "Units", "NAV", "Fund Value (₹)"]
+                    for c, h in enumerate(headers2, 1):
+                        ws2.cell(row=1, column=c, value=h)
+                    style_header(ws2, 1, len(headers2))
+                    for r, snap in enumerate(snap_data, 2):
+                        ws2.cell(row=r, column=1, value=snap["id"])
+                        ws2.cell(row=r, column=2, value=snap["label"])
+                        ws2.cell(row=r, column=3, value=snap["as_of_date"])
+                        ws2.cell(row=r, column=4, value=snap["total_value"])
+                        ws2.cell(row=r, column=5, value=snap["source"])
+                        ws2.cell(row=r, column=6, value=snap["fund_name"])
+                        ws2.cell(row=r, column=7, value=snap["units"])
+                        ws2.cell(row=r, column=8, value=snap["nav"])
+                        ws2.cell(row=r, column=9, value=snap["value"])
+                    style_data(ws2, 2, len(snap_data) + 1, len(headers2))
+                    auto_width(ws2)
+
+                    # ---- Sheet 3: Policy-wise History ----
+                    ws3 = wb.create_sheet("Policy History")
+                    headers3 = ["Policy", "As of Date", "Total Value (₹)", "Source", "# Funds Updated"]
+                    for c, h in enumerate(headers3, 1):
+                        ws3.cell(row=1, column=c, value=h)
+                    style_header(ws3, 1, len(headers3))
+                    
+                    policy_hist = {}
+                    for snap in snap_data:
+                        label = snap["label"]
+                        policy_hist.setdefault(label, []).append(snap)
+                    
+                    row = 2
+                    for label in sorted(policy_hist):
+                        snaps = policy_hist[label]
+                        snaps.sort(key=lambda x: x["as_of_date"])
+                        for s in snaps:
+                            fund_count = sum(1 for x in snap_data if x["id"] == s["id"] and x["fund_name"])
+                            ws3.cell(row=row, column=1, value=label)
+                            ws3.cell(row=row, column=2, value=s["as_of_date"])
+                            ws3.cell(row=row, column=3, value=s["total_value"])
+                            ws3.cell(row=row, column=4, value=s["source"])
+                            ws3.cell(row=row, column=5, value=fund_count)
+                            row += 1
+                    style_data(ws3, 2, row - 1, len(headers3))
+                    auto_width(ws3)
+
+                    # ---- Sheet 4: Latest Fund Breakdown ----
+                    ws4 = wb.create_sheet("Latest Fund Breakdown")
+                    headers4 = ["Policy", "As of Date", "Fund Name", "Units", "NAV", "Value (₹)"]
+                    for c, h in enumerate(headers4, 1):
+                        ws4.cell(row=1, column=c, value=h)
+                    style_header(ws4, 1, len(headers4))
+                    
+                    latest_snaps = {}
+                    for snap in snap_data:
+                        label = snap["label"]
+                        if label not in latest_snaps or snap["as_of_date"] > latest_snaps[label]["as_of_date"]:
+                            latest_snaps[label] = snap
+                    
+                    row = 2
+                    for label in sorted(latest_snaps):
+                        latest = latest_snaps[label]
+                        for f in [x for x in snap_data if x["id"] == latest["id"] and x["fund_name"]]:
+                            ws4.cell(row=row, column=1, value=label)
+                            ws4.cell(row=row, column=2, value=latest["as_of_date"])
+                            ws4.cell(row=row, column=3, value=f["fund_name"])
+                            ws4.cell(row=row, column=4, value=f["units"])
+                            ws4.cell(row=row, column=5, value=f["nav"])
+                            ws4.cell(row=row, column=6, value=f["value"])
+                            row += 1
+                    style_data(ws4, 2, row - 1, len(headers4))
+                    auto_width(ws4)
+
+                    # ---- Sheet 5: Combined Portfolio Timeline ----
+                    ws5 = wb.create_sheet("Combined Portfolio")
+                    headers5 = ["As of Date", "Combined Total (₹)", "Policies Updated", "Policies Total", "Change (₹)", "Change %"]
+                    for c, h in enumerate(headers5, 1):
+                        ws5.cell(row=1, column=c, value=h)
+                    style_header(ws5, 1, len(headers5))
+                    
+                    import pandas as pd
+                    hist_df = pd.DataFrame(snap_data, columns=["id", "label", "as_of_date", "total_value", "source",
+                                                                "fund_name", "units", "nav", "value"])
+                    hist_df["as_of_date"] = pd.to_datetime(hist_df["as_of_date"])
+                    hist_df["total_value"] = hist_df["total_value"].astype(float)
+                    
+                    wide = hist_df.pivot_table(
+                        index="as_of_date", columns="label", values="total_value", aggfunc="sum",
+                    ).sort_index()
+                    filled = wide.ffill()
+                    updated_counts = hist_df.groupby("as_of_date")["label"].nunique()
+                    combined = filled.sum(axis=1).rename("combined_total").reset_index()
+                    combined["policies_updated"] = (
+                        combined["as_of_date"].map(updated_counts).fillna(0).astype(int)
+                    )
+                    combined["policies_total"] = filled.notna().sum(axis=1).values
+                    combined["change"] = combined["combined_total"].diff()
+                    combined["change_pct"] = combined["combined_total"].pct_change() * 100
+
+                    for r, (_, row_data) in enumerate(combined.iterrows(), 2):
+                        ws5.cell(row=r, column=1, value=row_data["as_of_date"])
+                        ws5.cell(row=r, column=2, value=round(row_data["combined_total"], 2))
+                        ws5.cell(row=r, column=3, value=row_data["policies_updated"])
+                        ws5.cell(row=r, column=4, value=row_data["policies_total"])
+                        ws5.cell(row=r, column=5, value=round(row_data["change"], 2) if pd.notna(row_data["change"]) else "")
+                        ws5.cell(row=r, column=6, value=row_data["change_pct"] / 100 if pd.notna(row_data["change_pct"]) else "")
+                        ws5.cell(row=r, column=6).number_format = pct_fmt
+                    style_data(ws5, 2, len(combined) + 1, len(headers5))
+                    auto_width(ws5)
+
+                    # ---- Sheet 6: Policy Gains ----
+                    ws6 = wb.create_sheet("Policy Gains")
+                    headers6 = ["Policy", "Total Invested (₹)", "Current Value (₹)", "Gain (₹)", "Gain %", "As of Date"]
+                    for c, h in enumerate(headers6, 1):
+                        ws6.cell(row=1, column=c, value=h)
+                    style_header(ws6, 1, len(headers6))
+                    
+                    row = 2
+                    for p in policies:
+                        p_snaps = [x for x in snap_data if x["label"] == p["label"]]
+                        if p_snaps:
+                            latest = max(p_snaps, key=lambda x: x["as_of_date"])
+                            gain = latest["total_value"] - p["total_invested"]
+                            gain_pct = gain / p["total_invested"]
+                            ws6.cell(row=row, column=1, value=p["label"])
+                            ws6.cell(row=row, column=2, value=p["total_invested"])
+                            ws6.cell(row=row, column=3, value=latest["total_value"])
+                            ws6.cell(row=row, column=4, value=round(gain, 2))
+                            ws6.cell(row=row, column=5, value=round(gain_pct, 4))
+                            ws6.cell(row=row, column=5).number_format = pct_fmt
+                            ws6.cell(row=row, column=6, value=latest["as_of_date"])
+                            row += 1
+                    style_data(ws6, 2, row - 1, len(headers6))
+                    auto_width(ws6)
+
+                    # Save to bytes
+                    output = io.BytesIO()
+                    wb.save(output)
+                    output.seek(0)
+                    xlsx_bytes = output.read()
+
+                    # Download button
+                    st.download_button(
+                        label="📥 Export All Investment Data to Excel (6 sheets)",
+                        data=xlsx_bytes,
+                        file_name=f"investments_export_{date.today().isoformat()}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+                    st.caption("Sheets: Policies Master | All Snapshots (raw) | Policy History | Latest Fund Breakdown | Combined Portfolio | Policy Gains")
+
+    # --- Forms for adding policies/snapshots ---
+    st.divider()
+    
+    with st.expander("➕ Add / update a policy", expanded=not policies):
+        c1, c2, c3 = st.columns(3)
+        p_label = c1.text_input("Label", placeholder="e.g. IndusInd Nippon Life Premier (ULIP)")
+        p_insurer = c2.text_input("Insurer", placeholder="e.g. IndusInd Nippon")
+        p_policy_no = c3.text_input("Policy No.")
+        c4, c5, c6, c7 = st.columns(4)
+        p_type = c4.text_input("Type", value="ULIP")
+        p_premium = c5.number_input("Premium (₹)", min_value=0.0, step=1000.0)
+        p_freq = c6.selectbox("Premium frequency", ["Yearly", "Half-Yearly", "Quarterly", "Monthly"])
+        p_due = c7.date_input("Next premium due", value=None)
+        c8, c9, c10, c11 = st.columns(4)
+        p_sum_assured = c8.number_input("Sum assured (₹)", min_value=0.0, step=10000.0)
+        p_total_invested = c9.number_input("Total invested so far (₹)", min_value=0.0, step=10000.0)
+        p_premiums_paid = c10.number_input("Premiums paid", min_value=0, step=1)
+        p_total_premiums = c11.number_input("Total premiums (policy term)", min_value=0, step=1)
+        c12, c13, c14, c15 = st.columns(4)
+        p_maturity = c12.date_input("Maturity date", value=None)
+        p_auto_debit = c13.selectbox("Auto-debit (SI/ECS) set up?", ["Unknown", "Yes", "No"])
+        p_holder = c14.text_input("Policy holder", placeholder="e.g. Hitesh Rajpal")
+        p_nominee = c15.text_input("Nominee", placeholder="e.g. Manisha Rajpal")
+        if st.button("Save policy"):
+            if not p_label:
+                st.error("Give it a label first.")
             else:
-                c4.metric("Premiums paid", "—")
+                key = re.sub(r"[^a-z0-9]+", "_", p_label.lower()).strip("_")
+                save_investment_policy(
+                    key, p_label, insurer=p_insurer or None, policy_no=p_policy_no or None,
+                    policy_type=p_type or None, premium_amount=p_premium or None,
+                    premium_frequency=p_freq, next_premium_due=p_due.isoformat() if p_due else None,
+                    sum_assured=p_sum_assured or None, total_invested=p_total_invested or None,
+                    premiums_paid=p_premiums_paid or None, total_premiums=p_total_premiums or None,
+                    maturity_date=p_maturity.isoformat() if p_maturity else None,
+                    auto_debit_set_up={"Yes": True, "No": False, "Unknown": None}[p_auto_debit],
+                    policy_holder=p_holder or None, nominee=p_nominee or None,
+                )
+                st.success(f"Saved '{p_label}'.")
+                st.session_state.inv_policies_loaded = False
+                st.rerun()
 
-            c5, c6, c7 = st.columns(3)
-            c5.metric("Total invested", f"₹{policy['total_invested']:,.0f}" if policy["total_invested"] else "—")
-            c6.metric("Maturity", str(policy["maturity_date"]) if policy["maturity_date"] else "—")
-            auto_debit_label = {True: "Yes", False: "No ⚠️ pay manually", None: "Unknown"}[policy["auto_debit_set_up"]]
-            c7.metric("Auto-debit set up", auto_debit_label)
+    if policies:
+        st.divider()
+        st.markdown("### 📝 Record a new snapshot")
+        policy_label = st.selectbox("Policy", list(policy_options.keys()), key="inv_snap_policy")
+        key = policy_options[policy_label]
+        s_date = st.date_input("As of date", value=date.today(), key="inv_snap_date")
+        st.caption("Enter each fund's units & NAV — total will be computed.")
+        
+        # Get latest snapshot for this policy to pre-fill
+        latest_snap = None
+        if snap_data:
+            p_snaps = [x for x in snap_data if x["label"] == policy_label]
+            if p_snaps:
+                latest_snap = max(p_snaps, key=lambda x: x["as_of_date"])
+        
+        funds = []
+        if latest_snap and latest_snap["fund_name"]:
+            # Pre-fill from latest snapshot
+            for f in [x for x in snap_data if x["id"] == latest_snap["id"] and x["fund_name"]]:
+                with st.expander(f"Fund: {f['fund_name']}", expanded=True):
+                    c1, c2, c3 = st.columns(3)
+                    fname = c1.text_input("Fund name", value=f["fund_name"], key=f"fund_name_{f['fund_name']}")
+                    units = c2.number_input("Units", value=float(f["units"]) if f["units"] else 0.0, step=0.001, format="%.4f", key=f"fund_units_{f['fund_name']}")
+                    nav = c3.number_input("NAV", value=float(f["nav"]) if f["nav"] else 0.0, step=0.01, format="%.2f", key=f"fund_nav_{f['fund_name']}")
+                    funds.append({"fund_name": fname, "units": units, "nav": nav, "value": units * nav})
+        else:
+            # Empty fund row
+            with st.expander("Add Fund", expanded=True):
+                c1, c2, c3 = st.columns(3)
+                fname = c1.text_input("Fund name", key="fund_name_new")
+                units = c2.number_input("Units", min_value=0.0, step=0.001, format="%.4f", key="fund_units_new")
+                nav = c3.number_input("NAV", min_value=0.0, step=0.01, format="%.2f", key="fund_nav_new")
+                if fname:
+                    funds.append({"fund_name": fname, "units": units, "nav": nav, "value": units * nav})
+        
+        total_entered = sum(f["value"] for f in funds)
+        st.caption(f"Total of funds entered: ₹{total_entered:,.2f}")
+        if st.button("Save snapshot"):
+            if not funds:
+                st.error("Enter at least one fund with a value.")
+            else:
+                save_investment_snapshot(key, s_date.isoformat(), total_entered, funds, source="manual")
+                st.success(f"Saved snapshot as of {s_date} — total ₹{total_entered:,.2f}")
+                st.session_state.inv_snapshots_loaded = False
+                st.rerun()
 
-            snapshots = get_investment_snapshots(key)
-            latest = snapshots[0] if snapshots else None
-            if latest:
-                gain = None
-                if policy["total_invested"]:
-                    gain = latest["total_value"] - policy["total_invested"]
-                    gain_pct = gain / policy["total_invested"] * 100
-                fc1, fc2 = st.columns(2)
-                fc1.metric(f"Fund value (as of {latest['as_of_date']})", f"₹{latest['total_value']:,.2f}")
-                if gain is not None:
-                    fc2.metric("Gain vs. invested", f"₹{gain:,.0f}", delta=f"{gain_pct:.1f}%")
-
-            with st.expander("➕ Record a fund value snapshot"):
-                s_date = st.date_input("As of date", value=date.today(), key="snap_date")
-                st.caption("Enter each fund's value — add rows as needed. Fund names/count can change "
-                           "any time, so nothing here is fixed.")
-                n_funds = st.number_input("Number of funds", min_value=1, value=3, step=1, key="snap_nfunds")
-                funds = []
-                for i in range(int(n_funds)):
-                    fc1, fc2, fc3, fc4 = st.columns(4)
-                    fname = fc1.text_input("Fund name", key=f"snap_fname_{i}")
-                    funits = fc2.number_input("Units", min_value=0.0, step=0.01, key=f"snap_funits_{i}", format="%.2f")
-                    fnav = fc3.number_input("NAV", min_value=0.0, step=0.01, key=f"snap_fnav_{i}", format="%.2f")
-                    fvalue = fc4.number_input("Value (₹)", min_value=0.0, step=1.0, key=f"snap_fvalue_{i}")
-                    if fname and fvalue:
-                        funds.append({"fund_name": fname, "units": funits or None, "nav": fnav or None, "value": fvalue})
-                total_entered = sum(f["value"] for f in funds)
-                st.caption(f"Total of funds entered: ₹{total_entered:,.2f}")
-                if st.button("Save snapshot"):
-                    if not funds:
-                        st.error("Enter at least one fund with a value.")
-                    else:
-                        save_investment_snapshot(key, s_date.isoformat(), total_entered, funds, source="manual")
-                        st.success(f"Saved snapshot as of {s_date} — total ₹{total_entered:,.2f}")
-                        st.rerun()
-
-            if snapshots:
-                st.markdown("### History")
-                hist_df = pd.DataFrame(snapshots)[["as_of_date", "total_value", "source"]]
-                st.dataframe(hist_df, use_container_width=True)
-                with st.expander("Fund breakdown for latest snapshot"):
-                    st.dataframe(pd.DataFrame(get_investment_snapshot_funds(latest["id"])), use_container_width=True)
+        if snap_data:
+            st.markdown("### History")
+            hist_df = pd.DataFrame(snap_data)[["as_of_date", "total_value", "source"]]
+            st.dataframe(hist_df, use_container_width=True)
+            with st.expander("Fund breakdown for latest snapshot"):
+                st.dataframe(pd.DataFrame([x for x in snap_data if x["id"] == latest_snap["id"] and x["fund_name"]]), use_container_width=True)
 
 # ------------------------------------------------- Expected & Cross-Check -
 with tab_rules:
