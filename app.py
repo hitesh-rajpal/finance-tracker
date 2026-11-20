@@ -2044,7 +2044,9 @@ with tab_investments:
     # Load data (cached)
     _all_snap_data, _all_policies = load_investment_data()
 
-    if _all_snap_data:
+    if not _all_snap_data:
+        st.info("No investment snapshots found. Add a policy and snapshot first using the forms below.")
+    else:
         hist_df = pd.DataFrame(_all_snap_data, columns=["id", "label", "as_of_date", "total_value", "source",
                                                          "fund_name", "units", "nav", "value"])
         hist_df["as_of_date"] = pd.to_datetime(hist_df["as_of_date"])
