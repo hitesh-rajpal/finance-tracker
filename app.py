@@ -2020,7 +2020,7 @@ with tab_investments:
                "point-in-time snapshot you (or another tool via API) check and record periodically, "
                "not something derived from transactions.")
 
-    # Cache policies list too
+    # Cache policies list
     @st.cache_data(ttl=300)
     def get_policies_cached():
         return get_investment_policies()
@@ -2028,8 +2028,25 @@ with tab_investments:
     policies = get_policies_cached()
     policy_options = {p["label"]: p["key"] for p in policies}
 
-    # ----- Cached data loading -----
-    @st.cache_data(ttl=300, show_spinner="Loading investment data...")
+    # Show policies immediately (no DB join)
+    if policies:
+        st.markdown("### 📋 Your Policies")
+        for p in policies:
+            with st.expander(f"{p['label']} ({p.get('insurer','')})"):
+                c1, c2 = st.columns(2)
+                c1.write(f"**Type:** {p.get('policy_type','-')}")
+                c1.write(f"**Policy No:** {p.get('policy_no','-')}")
+                c1.write(f"**Premium:** ₹{p.get('premium_amount',0):,.0f}/{p.get('premium_frequency','-')}")
+                c1.write(f"**Next Due:** {p.get('next_premium_due','-')}")
+                c2.write(f"**Sum Assured:** ₹{p.get('sum_assured',0):,.0f}")
+                c2.write(f"**Total Invested:** ₹{p.get('total_invested',0):,.0f}")
+                c2.write(f"**Premiums Paid:** {p.get('premiums_paid',0)}/{p.get('total_premiums',0)}")
+                c2.write(f"**Maturity:** {p.get('maturity_date','-')}")
+
+    st.divider()
+
+    # ----- Cached data loading (on demand) -----
+    @st.cache_data(ttl=300)
     def load_investment_data():
         try:
             with get_conn() as _conn:
@@ -2050,14 +2067,32 @@ with tab_investments:
             st.error(f"Database error: {e}")
             return [], []
 
-    # Load data (cached) - show spinner while loading
-    loading_placeholder = st.empty()
-    loading_placeholder.info("🔄 Loading investment data from database...")
-    _all_snap_data, _all_policies = load_investment_data()
-    loading_placeholder.empty()
+    # Load data ON DEMAND with button
+    col_load, col_clear = st.columns([1, 4])
+    if col_load.button("🔄 Load Investment Snapshots", type="primary", use_container_width=True):
+        with st.spinner("Loading investment snapshots from database..."):
+            _all_snap_data, _all_policies = load_investment_data()
+        st.session_state["inv_data_loaded"] = True
+        st.session_state["_all_snap_data"] = _all_snap_data
+        st.session_state["_all_policies"] = _all_policies
+        st.rerun()
+
+    if col_clear.button("Clear Data", use_container_width=True):
+        if "inv_data_loaded" in st.session_state:
+            del st.session_state["inv_data_loaded"]
+            del st.session_state["_all_snap_data"]
+            del st.session_state["_all_policies"]
+        st.rerun()
+
+    # Show data if loaded
+    _all_snap_data = st.session_state.get("_all_snap_data", [])
+    _all_policies = st.session_state.get("_all_policies", [])
 
     if not _all_snap_data:
-        st.info("No investment snapshots found. Add a policy and snapshot first using the forms below.")
+        if st.session_state.get("inv_data_loaded"):
+            st.info("No investment snapshots found. Add a policy and snapshot first using the forms below.")
+        else:
+            st.info("👆 Click **'Load Investment Snapshots'** to fetch your data from the database.")
     else:
         hist_df = pd.DataFrame(_all_snap_data, columns=["id", "label", "as_of_date", "total_value", "source",
                                                          "fund_name", "units", "nav", "value"])
