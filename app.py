@@ -2379,219 +2379,219 @@ with tab_investments:
             )
             st.caption("Sheets: Policies Master | All Snapshots (raw) | Policy History | Latest Fund Breakdown | Combined Portfolio | Policy Gains")
 
-    if policies:
-        with get_conn() as _conn:
-            with _conn.cursor() as _cur:
-                _cur.execute("""
-                    SELECT p.label, s.as_of_date, s.total_value
-                    FROM investment_value_snapshots s
-                    JOIN investment_policies p ON p.key = s.policy_key
-                    ORDER BY s.as_of_date
-                """)
-                _all_snaps = _cur.fetchall()
+        if policies:
+            with get_conn() as _conn:
+                with _conn.cursor() as _cur:
+                    _cur.execute("""
+                        SELECT p.label, s.as_of_date, s.total_value
+                        FROM investment_value_snapshots s
+                        JOIN investment_policies p ON p.key = s.policy_key
+                        ORDER BY s.as_of_date
+                    """)
+                    _all_snaps = _cur.fetchall()
 
-        if _all_snaps:
-            hist_df = pd.DataFrame(_all_snaps, columns=["label", "as_of_date", "total_value"])
-            hist_df["total_value"] = hist_df["total_value"].astype(float)
+            if _all_snaps:
+                hist_df = pd.DataFrame(_all_snaps, columns=["label", "as_of_date", "total_value"])
+                hist_df["total_value"] = hist_df["total_value"].astype(float)
 
-            # A policy only gets a new value when you record a snapshot, so a
-            # date where just one or two policies were updated must not make
-            # the others disappear from the total. Carry each policy's latest
-            # value forward, then sum — so the line shows the whole portfolio
-            # as of each date, not just whatever was entered that day.
-            wide = hist_df.pivot_table(
-                index="as_of_date", columns="label", values="total_value", aggfunc="sum",
-            ).sort_index()
-            filled = wide.ffill()
-            updated_counts = hist_df.groupby("as_of_date")["label"].nunique()
-            combined = filled.sum(axis=1).rename("combined_total").reset_index()
-            combined["policies_updated"] = (
-                combined["as_of_date"].map(updated_counts).fillna(0).astype(int)
-            )
-            combined["policies_total"] = filled.notna().sum(axis=1).values
+                # A policy only gets a new value when you record a snapshot, so a
+                # date where just one or two policies were updated must not make
+                # the others disappear from the total. Carry each policy's latest
+                # value forward, then sum — so the line shows the whole portfolio
+                # as of each date, not just whatever was entered that day.
+                wide = hist_df.pivot_table(
+                    index="as_of_date", columns="label", values="total_value", aggfunc="sum",
+                ).sort_index()
+                filled = wide.ffill()
+                updated_counts = hist_df.groupby("as_of_date")["label"].nunique()
+                combined = filled.sum(axis=1).rename("combined_total").reset_index()
+                combined["policies_updated"] = (
+                    combined["as_of_date"].map(updated_counts).fillna(0).astype(int)
+                )
+                combined["policies_total"] = filled.notna().sum(axis=1).values
 
-            st.markdown("### 📊 Portfolio overview")
-            latest_date = combined["as_of_date"].max()
-            latest_total = combined.loc[combined["as_of_date"] == latest_date, "combined_total"].iloc[0]
-            peak_row = combined.loc[combined["combined_total"].idxmax()]
-            latest_row = combined.iloc[-1]
+                st.markdown("### 📊 Portfolio overview")
+                latest_date = combined["as_of_date"].max()
+                latest_total = combined.loc[combined["as_of_date"] == latest_date, "combined_total"].iloc[0]
+                peak_row = combined.loc[combined["combined_total"].idxmax()]
+                latest_row = combined.iloc[-1]
 
-            mc1, mc2, mc3 = st.columns(3)
-            mc1.metric(f"Combined value (as of {latest_date})", f"₹{latest_total:,.2f}")
-            mc2.metric("All-time combined peak", f"₹{peak_row['combined_total']:,.2f}",
-                       help=f"Reached on {peak_row['as_of_date']}")
-            if len(combined) > 1:
-                prev_total = combined["combined_total"].iloc[-2]
-                mc3.metric("Change since prior check", f"₹{latest_total - prev_total:,.2f}",
-                           delta=f"{(latest_total - prev_total) / prev_total * 100:.2f}%",
-                           help="Includes any policy added since the previous check.")
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric(f"Combined value (as of {latest_date})", f"₹{latest_total:,.2f}")
+                mc2.metric("All-time combined peak", f"₹{peak_row['combined_total']:,.2f}",
+                           help=f"Reached on {peak_row['as_of_date']}")
+                if len(combined) > 1:
+                    prev_total = combined["combined_total"].iloc[-2]
+                    mc3.metric("Change since prior check", f"₹{latest_total - prev_total:,.2f}",
+                               delta=f"{(latest_total - prev_total) / prev_total * 100:.2f}%",
+                               help="Includes any policy added since the previous check.")
 
-            st.caption(
-                f"Each policy keeps its most recent recorded value until a new snapshot replaces it. "
-                f"On {latest_date}, {latest_row['policies_updated']} of "
-                f"{latest_row['policies_total']} policies were updated; the rest are carried forward."
-            )
-
-            st.plotly_chart(
-                px.line(combined, x="as_of_date", y="combined_total", markers=True,
-                        labels={"as_of_date": "Date", "combined_total": "Combined value (₹)"},
-                        title="Combined portfolio value over time"),
-                use_container_width=True,
-            )
-
-            st.markdown("#### Date-by-date comparison")
-            compare = combined.copy()
-            compare["change"] = compare["combined_total"].diff()
-            compare["change_pct"] = compare["combined_total"].pct_change() * 100
-            st.dataframe(compare.style.format({
-                "combined_total": "₹{:,.2f}", "change": "₹{:,.2f}", "change_pct": "{:+.2f}%",
-            }), use_container_width=True)
-            st.caption("`policies_updated` is how many policies got a fresh snapshot that date; "
-                       "the rest carried their previous value into the total.")
-
-            st.markdown("#### Latest value per policy")
-            latest_per_policy = (
-                hist_df.sort_values("as_of_date").groupby("label").tail(1)
-                .sort_values("total_value", ascending=False)
-            )
-            st.dataframe(
-                latest_per_policy.rename(columns={
-                    "label": "Policy", "as_of_date": "As of", "total_value": "Value",
-                }).style.format({"Value": "₹{:,.2f}"}),
-                use_container_width=True,
-            )
-            stale = latest_per_policy[latest_per_policy["as_of_date"] < latest_date]
-            if len(stale):
                 st.caption(
-                    "Not updated on the latest date (carried forward): "
-                    + ", ".join(stale["label"].tolist())
+                    f"Each policy keeps its most recent recorded value until a new snapshot replaces it. "
+                    f"On {latest_date}, {latest_row['policies_updated']} of "
+                    f"{latest_row['policies_total']} policies were updated; the rest are carried forward."
                 )
 
-            st.markdown("#### Highest value per policy, and when")
-            per_policy_peak = hist_df.loc[hist_df.groupby("label")["total_value"].idxmax()]
-            per_policy_peak = per_policy_peak.sort_values("total_value", ascending=False)
-            st.dataframe(
-                per_policy_peak.rename(columns={"label": "Policy", "as_of_date": "Date of peak",
-                                                 "total_value": "Peak value"})
-                               .style.format({"Peak value": "₹{:,.2f}"}),
-                use_container_width=True,
-            )
-        st.divider()
-
-    with st.expander("➕ Add / update a policy", expanded=not policies):
-        c1, c2, c3 = st.columns(3)
-        p_label = c1.text_input("Label", placeholder="e.g. IndusInd Nippon Life Premier (ULIP)")
-        p_insurer = c2.text_input("Insurer", placeholder="e.g. IndusInd Nippon")
-        p_policy_no = c3.text_input("Policy No.")
-        c4, c5, c6, c7 = st.columns(4)
-        p_type = c4.text_input("Type", value="ULIP")
-        p_premium = c5.number_input("Premium (₹)", min_value=0.0, step=1000.0)
-        p_freq = c6.selectbox("Premium frequency", ["Yearly", "Half-Yearly", "Quarterly", "Monthly"])
-        p_due = c7.date_input("Next premium due", value=None)
-        c8, c9, c10, c11 = st.columns(4)
-        p_sum_assured = c8.number_input("Sum assured (₹)", min_value=0.0, step=10000.0)
-        p_total_invested = c9.number_input("Total invested so far (₹)", min_value=0.0, step=10000.0)
-        p_premiums_paid = c10.number_input("Premiums paid", min_value=0, step=1)
-        p_total_premiums = c11.number_input("Total premiums (policy term)", min_value=0, step=1)
-        c12, c13, c14, c15 = st.columns(4)
-        p_maturity = c12.date_input("Maturity date", value=None)
-        p_auto_debit = c13.selectbox("Auto-debit (SI/ECS) set up?", ["Unknown", "Yes", "No"])
-        p_holder = c14.text_input("Policy holder", placeholder="e.g. Hitesh Rajpal")
-        p_nominee = c15.text_input("Nominee", placeholder="e.g. Manisha Rajpal")
-        if st.button("Save policy"):
-            if not p_label:
-                st.error("Give it a label first.")
-            else:
-                key = re.sub(r"[^a-z0-9]+", "_", p_label.lower()).strip("_")
-                save_investment_policy(
-                    key, p_label, insurer=p_insurer or None, policy_no=p_policy_no or None,
-                    policy_type=p_type or None, premium_amount=p_premium or None,
-                    premium_frequency=p_freq, next_premium_due=p_due.isoformat() if p_due else None,
-                    sum_assured=p_sum_assured or None, total_invested=p_total_invested or None,
-                    premiums_paid=p_premiums_paid or None, total_premiums=p_total_premiums or None,
-                    maturity_date=p_maturity.isoformat() if p_maturity else None,
-                    auto_debit_set_up={"Yes": True, "No": False, "Unknown": None}[p_auto_debit],
-                    policy_holder=p_holder or None, nominee=p_nominee or None,
+                st.plotly_chart(
+                    px.line(combined, x="as_of_date", y="combined_total", markers=True,
+                            labels={"as_of_date": "Date", "combined_total": "Combined value (₹)"},
+                            title="Combined portfolio value over time"),
+                    use_container_width=True,
                 )
-                st.success(f"Saved '{p_label}'.")
-                st.rerun()
 
-    st.divider()
-    if not policies:
-        st.info("No policies yet — add one above.")
-    else:
-        sel_label = st.selectbox("Policy", list(policy_options.keys()))
-        policy = next(p for p in policies if p["label"] == sel_label)
-        key = policy["key"]
+                st.markdown("#### Date-by-date comparison")
+                compare = combined.copy()
+                compare["change"] = compare["combined_total"].diff()
+                compare["change_pct"] = compare["combined_total"].pct_change() * 100
+                st.dataframe(compare.style.format({
+                    "combined_total": "₹{:,.2f}", "change": "₹{:,.2f}", "change_pct": "{:+.2f}%",
+                }), use_container_width=True)
+                st.caption("`policies_updated` is how many policies got a fresh snapshot that date; "
+                           "the rest carried their previous value into the total.")
 
-        holder_bits = []
-        if policy["policy_holder"]:
-            holder_bits.append(f"Holder: **{policy['policy_holder']}**")
-        if policy["nominee"]:
-            holder_bits.append(f"Nominee: **{policy['nominee']}**")
-        if policy["policy_no"]:
-            holder_bits.append(f"Policy No. **{policy['policy_no']}**")
-        if holder_bits:
-            st.caption(" | ".join(holder_bits))
+                st.markdown("#### Latest value per policy")
+                latest_per_policy = (
+                    hist_df.sort_values("as_of_date").groupby("label").tail(1)
+                    .sort_values("total_value", ascending=False)
+                )
+                st.dataframe(
+                    latest_per_policy.rename(columns={
+                        "label": "Policy", "as_of_date": "As of", "total_value": "Value",
+                    }).style.format({"Value": "₹{:,.2f}"}),
+                    use_container_width=True,
+                )
+                stale = latest_per_policy[latest_per_policy["as_of_date"] < latest_date]
+                if len(stale):
+                    st.caption(
+                        "Not updated on the latest date (carried forward): "
+                        + ", ".join(stale["label"].tolist())
+                    )
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Premium", f"₹{policy['premium_amount']:,.0f} / {policy['premium_frequency']}"
-                   if policy["premium_amount"] else "—")
-        c2.metric("Next due", str(policy["next_premium_due"]) if policy["next_premium_due"] else "—")
-        c3.metric("Sum assured", f"₹{policy['sum_assured']:,.0f}" if policy["sum_assured"] else "—")
-        if policy["premiums_paid"] is not None and policy["total_premiums"]:
-            c4.metric("Premiums paid", f"{policy['premiums_paid']} of {policy['total_premiums']}")
-        else:
-            c4.metric("Premiums paid", "—")
+                st.markdown("#### Highest value per policy, and when")
+                per_policy_peak = hist_df.loc[hist_df.groupby("label")["total_value"].idxmax()]
+                per_policy_peak = per_policy_peak.sort_values("total_value", ascending=False)
+                st.dataframe(
+                    per_policy_peak.rename(columns={"label": "Policy", "as_of_date": "Date of peak",
+                                                     "total_value": "Peak value"})
+                                   .style.format({"Peak value": "₹{:,.2f}"}),
+                    use_container_width=True,
+                )
+            st.divider()
 
-        c5, c6, c7 = st.columns(3)
-        c5.metric("Total invested", f"₹{policy['total_invested']:,.0f}" if policy["total_invested"] else "—")
-        c6.metric("Maturity", str(policy["maturity_date"]) if policy["maturity_date"] else "—")
-        auto_debit_label = {True: "Yes", False: "No ⚠️ pay manually", None: "Unknown"}[policy["auto_debit_set_up"]]
-        c7.metric("Auto-debit set up", auto_debit_label)
-
-        snapshots = get_investment_snapshots(key)
-        latest = snapshots[0] if snapshots else None
-        if latest:
-            gain = None
-            if policy["total_invested"]:
-                gain = latest["total_value"] - policy["total_invested"]
-                gain_pct = gain / policy["total_invested"] * 100
-            fc1, fc2 = st.columns(2)
-            fc1.metric(f"Fund value (as of {latest['as_of_date']})", f"₹{latest['total_value']:,.2f}")
-            if gain is not None:
-                fc2.metric("Gain vs. invested", f"₹{gain:,.0f}", delta=f"{gain_pct:.1f}%")
-
-        with st.expander("➕ Record a fund value snapshot"):
-            s_date = st.date_input("As of date", value=date.today(), key="snap_date")
-            st.caption("Enter each fund's value — add rows as needed. Fund names/count can change "
-                       "any time, so nothing here is fixed.")
-            n_funds = st.number_input("Number of funds", min_value=1, value=3, step=1, key="snap_nfunds")
-            funds = []
-            for i in range(int(n_funds)):
-                fc1, fc2, fc3, fc4 = st.columns(4)
-                fname = fc1.text_input("Fund name", key=f"snap_fname_{i}")
-                funits = fc2.number_input("Units", min_value=0.0, step=0.01, key=f"snap_funits_{i}", format="%.2f")
-                fnav = fc3.number_input("NAV", min_value=0.0, step=0.01, key=f"snap_fnav_{i}", format="%.2f")
-                fvalue = fc4.number_input("Value (₹)", min_value=0.0, step=1.0, key=f"snap_fvalue_{i}")
-                if fname and fvalue:
-                    funds.append({"fund_name": fname, "units": funits or None, "nav": fnav or None, "value": fvalue})
-            total_entered = sum(f["value"] for f in funds)
-            st.caption(f"Total of funds entered: ₹{total_entered:,.2f}")
-            if st.button("Save snapshot"):
-                if not funds:
-                    st.error("Enter at least one fund with a value.")
+        with st.expander("➕ Add / update a policy", expanded=not policies):
+            c1, c2, c3 = st.columns(3)
+            p_label = c1.text_input("Label", placeholder="e.g. IndusInd Nippon Life Premier (ULIP)")
+            p_insurer = c2.text_input("Insurer", placeholder="e.g. IndusInd Nippon")
+            p_policy_no = c3.text_input("Policy No.")
+            c4, c5, c6, c7 = st.columns(4)
+            p_type = c4.text_input("Type", value="ULIP")
+            p_premium = c5.number_input("Premium (₹)", min_value=0.0, step=1000.0)
+            p_freq = c6.selectbox("Premium frequency", ["Yearly", "Half-Yearly", "Quarterly", "Monthly"])
+            p_due = c7.date_input("Next premium due", value=None)
+            c8, c9, c10, c11 = st.columns(4)
+            p_sum_assured = c8.number_input("Sum assured (₹)", min_value=0.0, step=10000.0)
+            p_total_invested = c9.number_input("Total invested so far (₹)", min_value=0.0, step=10000.0)
+            p_premiums_paid = c10.number_input("Premiums paid", min_value=0, step=1)
+            p_total_premiums = c11.number_input("Total premiums (policy term)", min_value=0, step=1)
+            c12, c13, c14, c15 = st.columns(4)
+            p_maturity = c12.date_input("Maturity date", value=None)
+            p_auto_debit = c13.selectbox("Auto-debit (SI/ECS) set up?", ["Unknown", "Yes", "No"])
+            p_holder = c14.text_input("Policy holder", placeholder="e.g. Hitesh Rajpal")
+            p_nominee = c15.text_input("Nominee", placeholder="e.g. Manisha Rajpal")
+            if st.button("Save policy"):
+                if not p_label:
+                    st.error("Give it a label first.")
                 else:
-                    save_investment_snapshot(key, s_date.isoformat(), total_entered, funds, source="manual")
-                    st.success(f"Saved snapshot as of {s_date} — total ₹{total_entered:,.2f}")
+                    key = re.sub(r"[^a-z0-9]+", "_", p_label.lower()).strip("_")
+                    save_investment_policy(
+                        key, p_label, insurer=p_insurer or None, policy_no=p_policy_no or None,
+                        policy_type=p_type or None, premium_amount=p_premium or None,
+                        premium_frequency=p_freq, next_premium_due=p_due.isoformat() if p_due else None,
+                        sum_assured=p_sum_assured or None, total_invested=p_total_invested or None,
+                        premiums_paid=p_premiums_paid or None, total_premiums=p_total_premiums or None,
+                        maturity_date=p_maturity.isoformat() if p_maturity else None,
+                        auto_debit_set_up={"Yes": True, "No": False, "Unknown": None}[p_auto_debit],
+                        policy_holder=p_holder or None, nominee=p_nominee or None,
+                    )
+                    st.success(f"Saved '{p_label}'.")
                     st.rerun()
 
-        if snapshots:
-            st.markdown("### History")
-            hist_df = pd.DataFrame(snapshots)[["as_of_date", "total_value", "source"]]
-            st.dataframe(hist_df, use_container_width=True)
-            with st.expander("Fund breakdown for latest snapshot"):
-                st.dataframe(pd.DataFrame(get_investment_snapshot_funds(latest["id"])), use_container_width=True)
+        st.divider()
+        if not policies:
+            st.info("No policies yet — add one above.")
+        else:
+            sel_label = st.selectbox("Policy", list(policy_options.keys()))
+            policy = next(p for p in policies if p["label"] == sel_label)
+            key = policy["key"]
+
+            holder_bits = []
+            if policy["policy_holder"]:
+                holder_bits.append(f"Holder: **{policy['policy_holder']}**")
+            if policy["nominee"]:
+                holder_bits.append(f"Nominee: **{policy['nominee']}**")
+            if policy["policy_no"]:
+                holder_bits.append(f"Policy No. **{policy['policy_no']}**")
+            if holder_bits:
+                st.caption(" | ".join(holder_bits))
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Premium", f"₹{policy['premium_amount']:,.0f} / {policy['premium_frequency']}"
+                       if policy["premium_amount"] else "—")
+            c2.metric("Next due", str(policy["next_premium_due"]) if policy["next_premium_due"] else "—")
+            c3.metric("Sum assured", f"₹{policy['sum_assured']:,.0f}" if policy["sum_assured"] else "—")
+            if policy["premiums_paid"] is not None and policy["total_premiums"]:
+                c4.metric("Premiums paid", f"{policy['premiums_paid']} of {policy['total_premiums']}")
+            else:
+                c4.metric("Premiums paid", "—")
+
+            c5, c6, c7 = st.columns(3)
+            c5.metric("Total invested", f"₹{policy['total_invested']:,.0f}" if policy["total_invested"] else "—")
+            c6.metric("Maturity", str(policy["maturity_date"]) if policy["maturity_date"] else "—")
+            auto_debit_label = {True: "Yes", False: "No ⚠️ pay manually", None: "Unknown"}[policy["auto_debit_set_up"]]
+            c7.metric("Auto-debit set up", auto_debit_label)
+
+            snapshots = get_investment_snapshots(key)
+            latest = snapshots[0] if snapshots else None
+            if latest:
+                gain = None
+                if policy["total_invested"]:
+                    gain = latest["total_value"] - policy["total_invested"]
+                    gain_pct = gain / policy["total_invested"] * 100
+                fc1, fc2 = st.columns(2)
+                fc1.metric(f"Fund value (as of {latest['as_of_date']})", f"₹{latest['total_value']:,.2f}")
+                if gain is not None:
+                    fc2.metric("Gain vs. invested", f"₹{gain:,.0f}", delta=f"{gain_pct:.1f}%")
+
+            with st.expander("➕ Record a fund value snapshot"):
+                s_date = st.date_input("As of date", value=date.today(), key="snap_date")
+                st.caption("Enter each fund's value — add rows as needed. Fund names/count can change "
+                           "any time, so nothing here is fixed.")
+                n_funds = st.number_input("Number of funds", min_value=1, value=3, step=1, key="snap_nfunds")
+                funds = []
+                for i in range(int(n_funds)):
+                    fc1, fc2, fc3, fc4 = st.columns(4)
+                    fname = fc1.text_input("Fund name", key=f"snap_fname_{i}")
+                    funits = fc2.number_input("Units", min_value=0.0, step=0.01, key=f"snap_funits_{i}", format="%.2f")
+                    fnav = fc3.number_input("NAV", min_value=0.0, step=0.01, key=f"snap_fnav_{i}", format="%.2f")
+                    fvalue = fc4.number_input("Value (₹)", min_value=0.0, step=1.0, key=f"snap_fvalue_{i}")
+                    if fname and fvalue:
+                        funds.append({"fund_name": fname, "units": funits or None, "nav": fnav or None, "value": fvalue})
+                total_entered = sum(f["value"] for f in funds)
+                st.caption(f"Total of funds entered: ₹{total_entered:,.2f}")
+                if st.button("Save snapshot"):
+                    if not funds:
+                        st.error("Enter at least one fund with a value.")
+                    else:
+                        save_investment_snapshot(key, s_date.isoformat(), total_entered, funds, source="manual")
+                        st.success(f"Saved snapshot as of {s_date} — total ₹{total_entered:,.2f}")
+                        st.rerun()
+
+            if snapshots:
+                st.markdown("### History")
+                hist_df = pd.DataFrame(snapshots)[["as_of_date", "total_value", "source"]]
+                st.dataframe(hist_df, use_container_width=True)
+                with st.expander("Fund breakdown for latest snapshot"):
+                    st.dataframe(pd.DataFrame(get_investment_snapshot_funds(latest["id"])), use_container_width=True)
 
 # ------------------------------------------------- Expected & Cross-Check -
 with tab_rules:
