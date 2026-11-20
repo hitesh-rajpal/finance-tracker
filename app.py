@@ -2061,6 +2061,116 @@ if _active == "💸 Fund Flow Recon":
             c2.metric("Ledger mismatches", fps["ledger_mismatches"])
             c3.metric("B/F breaks", fps["continuity_breaks"])
 
+        # ---- Fund Flow Recon Excel Export ----
+        if ff_results:
+            import io
+            import openpyxl
+            from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+            from openpyxl.utils import get_column_letter
+
+            wb = openpyxl.Workbook()
+            header_font = Font(bold=True, color="FFFFFF")
+            header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+            header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            thin_border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                 top=Side(style='thin'), bottom=Side(style='thin'))
+
+            def style_header(ws, row, max_col):
+                for col in range(1, max_col + 1):
+                    cell = ws.cell(row=row, column=col)
+                    cell.font = header_font; cell.fill = header_fill
+                    cell.alignment = header_align; cell.border = thin_border
+
+            def style_data(ws, start_row, end_row, max_col):
+                for r in range(start_row, end_row + 1):
+                    for c in range(1, max_col + 1):
+                        cell = ws.cell(row=r, column=c)
+                        cell.border = thin_border; cell.alignment = Alignment(horizontal="center", vertical="center")
+
+            def auto_width(ws, min_w=10, max_w=40):
+                for col in ws.columns:
+                    max_len = 0; cl = get_column_letter(col[0].column)
+                    for cell in col:
+                        try:
+                            if cell.value: max_len = max(max_len, len(str(cell.value)))
+                        except: pass
+                    ws.column_dimensions[cl].width = min(max(max_len + 2, min_w), max_w)
+
+            # Sheet 1: Summary
+            ws1 = wb.active; ws1.title = "Summary"
+            for c, h in enumerate(["Metric", "Value"], 1): ws1.cell(row=1, column=c, value=h)
+            style_header(ws1, 1, 2)
+            s = ff.summary(ff_results["fund_match"], ff_results["bank_unmatched"], ff_results["cas_match"])
+            for r, (k, v) in enumerate(s.items(), 2):
+                ws1.cell(row=r, column=1, value=k.replace("_", " ").title())
+                ws1.cell(row=r, column=2, value=v)
+            style_data(ws1, 2, len(s)+1, 2); auto_width(ws1)
+
+            # Sheet 2: Fund Transfers ↔ Bank (clean columns only)
+            ws2 = wb.create_sheet("Fund Transfers vs Bank")
+            fm = ff_results["fund_match"]
+            if not fm.empty:
+                clean_cols = [c for c in fm.columns if c not in ("index",)]
+                for c, h in enumerate(clean_cols, 1): ws2.cell(row=1, column=c, value=h)
+                style_header(ws2, 1, len(clean_cols))
+                for r, (_, row) in enumerate(fm.iterrows(), 2):
+                    for c, col in enumerate(clean_cols, 1):
+                        ws2.cell(row=r, column=c, value=row[col])
+                style_data(ws2, 2, len(fm)+1, len(clean_cols))
+            auto_width(ws2)
+
+            # Sheet 3: Bank 5paisa Rows Without Ledger Match
+            ws3 = wb.create_sheet("Bank Unmatched 5paisa")
+            bu = ff_results["bank_unmatched"]
+            if not bu.empty:
+                clean_cols = [c for c in bu.columns if c not in ("index",)]
+                for c, h in enumerate(clean_cols, 1): ws3.cell(row=1, column=c, value=h)
+                style_header(ws3, 1, len(clean_cols))
+                for r, (_, row) in enumerate(bu.iterrows(), 2):
+                    for c, col in enumerate(clean_cols, 1):
+                        ws3.cell(row=r, column=c, value=row[col])
+                style_data(ws3, 2, len(bu)+1, len(clean_cols))
+            auto_width(ws3)
+
+            # Sheet 4: Bank (AMC) ↔ CAS Matches
+            ws4 = wb.create_sheet("Bank AMC vs CAS")
+            cm = ff_results["cas_match"]
+            if not cm.empty:
+                clean_cols = [c for c in cm.columns if c not in ("index",)]
+                for c, h in enumerate(clean_cols, 1): ws4.cell(row=1, column=c, value=h)
+                style_header(ws4, 1, len(clean_cols))
+                for r, (_, row) in enumerate(cm.iterrows(), 2):
+                    for c, col in enumerate(clean_cols, 1):
+                        ws4.cell(row=r, column=c, value=row[col])
+                style_data(ws4, 2, len(cm)+1, len(clean_cols))
+            auto_width(ws4)
+
+            # Sheet 5: CAS Transactions (clean)
+            ws5 = wb.create_sheet("CAS Transactions")
+            cas = ff_results["cas_rows"]
+            if not cas.empty:
+                clean_cols = [c for c in cas.columns if c not in ("index",)]
+                for c, h in enumerate(clean_cols, 1): ws5.cell(row=1, column=c, value=h)
+                style_header(ws5, 1, len(clean_cols))
+                for r, (_, row) in enumerate(cas.iterrows(), 2):
+                    for c, col in enumerate(clean_cols, 1):
+                        ws5.cell(row=r, column=c, value=row[col])
+                style_data(ws5, 2, len(cas)+1, len(clean_cols))
+            auto_width(ws5)
+
+            output = io.BytesIO()
+            wb.save(output)
+            output.seek(0)
+            xlsx_bytes = output.read()
+
+            st.download_button(
+                label="📥 Export Fund Flow Recon to Excel (5 sheets)",
+                data=xlsx_bytes,
+                file_name=f"fund_flow_recon_{date.today().isoformat()}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
 # --------------------------------------------------------- Investments ---
 if _active == "💹 Investments":
     st.caption("Track ULIP/investment policies that live outside bank statements — fund value is a "
