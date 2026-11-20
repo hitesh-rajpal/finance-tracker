@@ -2108,11 +2108,12 @@ if _active == "💹 Investments":
                 c1, c2 = st.columns(2)
                 c1.write(f"**Type:** {p.get('policy_type','-')}")
                 c1.write(f"**Policy No:** {p.get('policy_no','-')}")
-                c1.write(f"**Premium:** ₹{p.get('premium_amount',0):,.0f}/{p.get('premium_frequency','-')}")
-                c1.write(f"**Next Due:** {p.get('next_premium_due','-')}")
-                c2.write(f"**Sum Assured:** ₹{p.get('sum_assured',0):,.0f}")
-                c2.write(f"**Total Invested:** ₹{p.get('total_invested',0):,.0f}")
-                c2.write(f"**Premiums Paid:** {p.get('premiums_paid',0)}/{p.get('total_premiums',0)}")
+                # Amount fields can be NULL in the DB, so coerce before formatting.
+                c1.write(f"**Premium:** ₹{(p.get('premium_amount') or 0):,.0f}/{p.get('premium_frequency') or '-'}")
+                c1.write(f"**Next Due:** {p.get('next_premium_due') or '-'}")
+                c2.write(f"**Sum Assured:** ₹{(p.get('sum_assured') or 0):,.0f}")
+                c2.write(f"**Total Invested:** ₹{(p.get('total_invested') or 0):,.0f}")
+                c2.write(f"**Premiums Paid:** {p.get('premiums_paid') or 0}/{p.get('total_premiums') or 0}")
                 c2.write(f"**Maturity:** {p.get('maturity_date','-')}")
 
         st.divider()
@@ -2124,13 +2125,15 @@ if _active == "💹 Investments":
                 with st.spinner("Loading investment snapshots..."):
                     try:
                         with get_conn() as _conn:
-                            with _conn.cursor() as _cur:
+                            # RealDictCursor so rows are dicts — the snapshot form
+                            # below (and the exports) index them by column name.
+                            with _conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as _cur:
                                 _cur.execute("""
                                     SELECT s.id, p.label, s.as_of_date, s.total_value, s.source,
                                            f.fund_name, f.units, f.nav, f.value
                                     FROM investment_value_snapshots s
                                     JOIN investment_policies p ON p.key = s.policy_key
-                                    LEFT JOIN investment_snapshot_funds f ON f.snapshot_id = s.id
+                                    LEFT JOIN investment_value_funds f ON f.snapshot_id = s.id
                                     ORDER BY p.label, s.as_of_date, f.fund_name
                                 """)
                                 snap_data = _cur.fetchall()
@@ -2462,14 +2465,16 @@ if _active == "💹 Investments":
                         p_snaps = [x for x in snap_data if x["label"] == p["label"]]
                         if p_snaps:
                             latest = max(p_snaps, key=lambda x: x["as_of_date"])
-                            gain = latest["total_value"] - p["total_invested"]
-                            gain_pct = gain / p["total_invested"]
+                            invested = p.get("total_invested") or 0
+                            gain = latest["total_value"] - invested
+                            gain_pct = (gain / invested) if invested else None
                             ws6.cell(row=row, column=1, value=p["label"])
-                            ws6.cell(row=row, column=2, value=p["total_invested"])
+                            ws6.cell(row=row, column=2, value=invested)
                             ws6.cell(row=row, column=3, value=latest["total_value"])
                             ws6.cell(row=row, column=4, value=round(gain, 2))
-                            ws6.cell(row=row, column=5, value=round(gain_pct, 4))
-                            ws6.cell(row=row, column=5).number_format = pct_fmt
+                            if gain_pct is not None:
+                                ws6.cell(row=row, column=5, value=round(gain_pct, 4))
+                                ws6.cell(row=row, column=5).number_format = pct_fmt
                             ws6.cell(row=row, column=6, value=latest["as_of_date"])
                             row += 1
                     style_data(ws6, 2, row - 1, len(headers6))
