@@ -29,13 +29,16 @@ class FivePaisaOrderParser:
         self.file_type = self._detect_file_type()
 
     def _detect_file_type(self) -> Literal["equity", "fno", "mf"]:
-        name = self.file_path.name
-        if "Equity_Transactions" in name:
+        name = self.file_path.name.upper()
+        # Match both 5paisa web export names and the older script names
+        if "EQUITY_TRANSACTION" in name:
             return "equity"
-        elif "FnO_Transactions" in name:
+        elif "DERIVATIVES_TRANSACTION" in name or "FNO_TRANSACTION" in name or "FNO_TRANSACTIONS" in name:
             return "fno"
-        elif "MF_Transactions" in name:
+        elif "MUTUALFUNDS_TRANSACTION" in name or "MF_TRANSACTION" in name:
             return "mf"
+        elif "COMMODITY_TRANSACTION" in name:
+            return "fno"  # commodity uses F&O parser
         else:
             # Try to infer from content
             return "equity"
@@ -152,7 +155,16 @@ def parse_5paisa_orders_dir(dir_path: str | Path) -> dict[str, pd.DataFrame]:
     """Parse all 5paisa order files in a directory."""
     dir_path = Path(dir_path)
     results = {}
-    for pattern in ["Equity_Transactions*.xlsx", "FnO_Transactions*.xlsx", "MF_Transactions*.xlsx"]:
+    # Match actual 5paisa export filenames (case-insensitive glob on Windows)
+    patterns = [
+        "*EQUITY_Transaction*.xlsx",
+        "*DERIVATIVES_Transaction*.xlsx",
+        "*FNO_Transaction*.xlsx",
+        "*MUTUALFUNDS_Transaction*.xlsx",
+        "*MF_Transaction*.xlsx",
+        "*COMMODITY_Transaction*.xlsx",
+    ]
+    for pattern in patterns:
         for file_path in dir_path.glob(pattern):
             try:
                 results[file_path.name] = parse_5paisa_orders(file_path)
