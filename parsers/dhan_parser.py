@@ -247,3 +247,303 @@ def get_dhan_fund_movements(ledger_df: pd.DataFrame) -> pd.DataFrame:
     funds = funds[['date', 'Narration', 'Voucher_Descriptions', 'amount']].copy()
     funds.columns = ['date', 'type', 'description', 'amount']
     return funds.sort_values('date').reset_index(drop=True)
+
+
+# ============================================================
+# Dhan P&L and Tax P&L parsers (replace missing trade history)
+# ============================================================
+
+def parse_dhan_pnl(filepath: str) -> dict[str, pd.DataFrame]:
+    """
+    Parse Dhan P&L .xls file (regular P&L, not tax).
+    
+    Returns dict with:
+    - 'equity_holdings': current equity positions with unrealized P&L
+    - 'fno_trades': F&O trade-level data (realized P&L per contract)
+    - 'summary': segment-wise P&L summary
+    
+    The file has multiple sections:
+    1. Segment summary (rows ~6-10)
+    2. Equity holdings (rows ~13+)
+    3. F&O trades (rows after "F&O Segment" header)
+    """
+    df = pd.read_excel(filepath, header=None, engine='xlrd')
+    
+    # Find section headers by scanning all rows
+    segment_summary_rows = []
+    equity_holdings_rows = []
+    fno_trades_rows = []
+    
+    # First pass: detect section boundaries
+    in_summary = False
+    in_equity = False
+    in_fno = False
+    
+    for idx, row in df.iterrows():
+        first_cell = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
+        second_cell = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
+        
+        # Detect section headers - match actual Dhan P&L format
+        if first_cell == "Segment" and second_cell == "":
+            in_summary = True
+            in_equity = False
+            in_fno = False
+            continue
+        elif "Equity Segment" in first_cell:
+            # Next row will be "Sr." | "Security Name" header, then data rows
+            in_summary = False
+            in_equity = True
+            in_fno = False
+            continue
+        elif "F&O Segment" in first_cell:
+            in_summary = False
+            in_equity = False
+            in_fno = True
+            continue
+        elif first_cell in ("Commodities", "Currency") and second_cell == "":
+            in_summary = True
+            in_equity = False
+            in_fno = False
+            continue
+        
+        # Collect rows based on active section
+        if in_summary and first_cell in ("Equity", "Futures and Options", "Commodities", "Currency"):
+            segment_summary_rows.append(idx)
+        elif in_equity and first_cell.isdigit():
+            equity_holdings_rows.append(idx)
+        elif in_fno and first_cell.isdigit():
+            fno_trades_rows.append(idx)
+    
+    # Parse segment summary
+    summary_data = []
+    for idx in segment_summary_rows:
+        row = df.iloc[idx]
+        summary_data.append({
+            'segment': str(row.iloc[0]).strip(),
+            'buy_value': pd.to_numeric(row.iloc[4], errors='coerce'),
+            'sell_value': pd.to_numeric(row.iloc[5], errors='coerce'),
+            'gross_pnl': pd.to_numeric(row.iloc[6], errors='coerce'),
+            'brokerage': pd.to_numeric(row.iloc[7], errors='coerce'),
+            'exchange_charges': pd.to_numeric(row.iloc[8], errors='coerce'),
+            'sebi_fees': pd.to_numeric(row.iloc[9], errors='coerce'),
+            'gst': pd.to_numeric(row.iloc[10], errors='coerce'),
+            'stt': pd.to_numeric(row.iloc[11], errors='coerce'),
+            'stamp_duty': pd.to_numeric(row.iloc[12], errors='coerce'),
+            'other_charges': pd.to_numeric(row.iloc[13], errors='coerce'),
+            'total_charges': pd.to_numeric(row.iloc[14], errors='coerce'),
+            'net_pnl': pd.to_numeric(row.iloc[15], errors='coerce'),
+        })
+    
+    # Parse equity holdings (unrealized P&L)
+    equity_cols = ['sr', 'security_name', 'isin', 'buy_qty', 'avg_buy_price', 'buy_value',
+                   'sell_qty', 'avg_sell_price', 'sell_value', 'realized_pnl', 'realized_pnl_pct',
+                   'open_qty', 'open_avg_price', 'closing_rate', 'unrealized_pnl', 'unrealized_pnl_pct']
+    equity_data = []
+    for idx in equity_holdings_rows:
+        row = df.iloc[idx]
+        vals = [row.iloc[i] for i in range(min(18, len(row)))]
+        if len(vals) >= 15 and pd.notna(vals[1]) and str(vals[1]).strip():
+            equity_data.append(dict(zip(equity_cols[:len(vals)], vals)))
+    
+    # Parse F&O trades
+    fno_cols = ['sr', 'security_name', 'isin', 'buy_qty', 'avg_buy_price', 'buy_value',
+                'sell_qty', 'avg_sell_price', 'sell_value', 'realized_pnl', 'realized_pnl_pct',
+                'open_qty', 'open_avg_price', 'closing_rate', 'unrealized_pnl', 'unrealized_pnl_pct']
+    fno_data = []
+    for idx in fno_trades_rows:
+        row = df.iloc[idx]
+        vals = [row.iloc[i] for i in range(min(18, len(row)))]
+        if len(vals) >= 15 and pd.notna(vals[1]) and str(vals[1]).strip():
+            fno_data.append(dict(zip(fno_cols[:len(vals)], vals)))
+    
+    return {
+        'summary': pd.DataFrame(summary_data) if summary_data else pd.DataFrame(),
+        'equity_holdings': pd.DataFrame(equity_data) if equity_data else pd.DataFrame(),
+        'fno_trades': pd.DataFrame(fno_data) if fno_data else pd.DataFrame(),
+    }
+
+
+def parse_dhan_tax_pnl(filepath: str) -> dict[str, pd.DataFrame]:
+    """
+    Parse Dhan Tax P&L .xls file.
+    
+    Returns dict with:
+    - 'equity_trades': equity trade-level data (buy/sell dates, prices, P&L)
+    - 'summary': tax category summary (ST, LT, Intraday)
+    
+    Contains:
+    1. Tax summary by holding period (ST, LT, Intraday)
+    2. Equity trades with buy/sell dates, quantities, prices, P&L
+    """
+    df = pd.read_excel(filepath, header=None, engine='xlrd')
+    
+    # Find the equity trades section
+    trades_rows = []
+    summary_rows = []
+    current_section = None
+    
+    for idx, row in df.iterrows():
+        first_cell = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
+        second_cell = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
+        
+        # Check for summary category rows
+        if first_cell in ("Intraday / Speculation", "Short Term", "Long Term") and second_cell == "":
+            summary_rows.append(idx)
+            current_section = "summary"
+            continue
+        
+        # Detect sections - match actual Tax P&L format
+        if "Equity Segment" in first_cell and ("Short Term" in first_cell or "Intraday" in first_cell):
+            current_section = "trades"
+            continue
+        elif "Sr." in first_cell and "Security Name" in str(row.iloc[1]):
+            current_section = "trades"
+            continue
+        
+        if current_section == "trades" and first_cell.isdigit():
+            trades_rows.append(idx)
+    
+    # Parse tax summary
+    summary_data = []
+    for idx in summary_rows:
+        row = df.iloc[idx]
+        cat = str(row.iloc[0]).strip()
+        summary_data.append({
+            'category': cat,
+            'buy_value': pd.to_numeric(row.iloc[3], errors='coerce'),
+            'sell_value': pd.to_numeric(row.iloc[4], errors='coerce'),
+            'gross_pnl': pd.to_numeric(row.iloc[5], errors='coerce'),
+            'brokerage': pd.to_numeric(row.iloc[6], errors='coerce'),
+            'exchange_charges': pd.to_numeric(row.iloc[7], errors='coerce'),
+            'sebi_fees': pd.to_numeric(row.iloc[8], errors='coerce'),
+            'gst': pd.to_numeric(row.iloc[9], errors='coerce'),
+            'stt': pd.to_numeric(row.iloc[10], errors='coerce'),
+            'stamp_duty': pd.to_numeric(row.iloc[11], errors='coerce'),
+            'other_charges': pd.to_numeric(row.iloc[12], errors='coerce'),
+            'total_charges': pd.to_numeric(row.iloc[13], errors='coerce'),
+            'net_pnl': pd.to_numeric(row.iloc[14], errors='coerce'),
+            'turnover': pd.to_numeric(row.iloc[15], errors='coerce'),
+        })
+    
+    # Parse equity trades
+    trade_cols = ['sr', 'security_name', 'isin', 'buy_date', 'buy_qty', 'avg_buy_price', 'buy_value',
+                  'sell_date', 'sell_qty', 'avg_sell_price', 'sell_value', 'holding_period',
+                  'gross_pnl', 'total_charges', 'net_pnl']
+    trades_data = []
+    for idx in trades_rows:
+        row = df.iloc[idx]
+        vals = [row.iloc[i] for i in range(min(16, len(row)))]
+        if len(vals) >= 14 and pd.notna(vals[1]) and str(vals[1]).strip():
+            trades_data.append(dict(zip(trade_cols[:len(vals)], vals)))
+    
+    return {
+        'summary': pd.DataFrame(summary_data) if summary_data else pd.DataFrame(),
+        'equity_trades': pd.DataFrame(trades_data) if trades_data else pd.DataFrame(),
+    }
+
+
+def pnl_to_standard_trades(pnl_result: dict) -> pd.DataFrame:
+    """
+    Convert parsed P&L data to standard trade format (like parse_dhan_trades output).
+    
+    Combines:
+    - F&O trades from regular P&L
+    - Equity trades from Tax P&L
+    """
+    standard_trades = []
+    
+    # F&O trades from regular P&L
+    fno_df = pnl_result.get('fno_trades', pd.DataFrame())
+    if not fno_df.empty:
+        for _, row in fno_df.iterrows():
+            sec_name = str(row.get('security_name', '')).strip()
+            if not sec_name:
+                continue
+            
+            # Parse buy side
+            buy_qty = pd.to_numeric(row.get('buy_qty', 0), errors='coerce')
+            if pd.notna(buy_qty) and buy_qty > 0:
+                standard_trades.append({
+                    'date': pd.NaT,  # P&L doesn't have dates per trade
+                    'time': pd.NaT,
+                    'symbol': sec_name,
+                    'side': 'Buy',
+                    'quantity': int(buy_qty),
+                    'price': pd.to_numeric(row.get('avg_buy_price', 0), errors='coerce'),
+                    'value': pd.to_numeric(row.get('buy_value', 0), errors='coerce'),
+                    'segment': 'Derivative',
+                    'order_type': 'MARGIN',
+                    'exchange': 'NSE',
+                    'status': 'Traded',
+                })
+            
+            # Parse sell side
+            sell_qty = pd.to_numeric(row.get('sell_qty', 0), errors='coerce')
+            if pd.notna(sell_qty) and sell_qty > 0:
+                standard_trades.append({
+                    'date': pd.NaT,
+                    'time': pd.NaT,
+                    'symbol': sec_name,
+                    'side': 'Sell',
+                    'quantity': int(sell_qty),
+                    'price': pd.to_numeric(row.get('avg_sell_price', 0), errors='coerce'),
+                    'value': pd.to_numeric(row.get('sell_value', 0), errors='coerce'),
+                    'segment': 'Derivative',
+                    'order_type': 'MARGIN',
+                    'exchange': 'NSE',
+                    'status': 'Traded',
+                })
+    
+    return pd.DataFrame(standard_trades)
+
+
+def tax_pnl_to_standard_trades(tax_pnl_result: dict) -> pd.DataFrame:
+    """
+    Convert parsed Tax P&L equity trades to standard trade format.
+    """
+    trades_df = tax_pnl_result.get('equity_trades', pd.DataFrame())
+    if trades_df.empty:
+        return pd.DataFrame()
+    
+    standard_trades = []
+    for _, row in trades_df.iterrows():
+        sec_name = str(row.get('security_name', '')).strip()
+        if not sec_name:
+            continue
+        
+        buy_date = row.get('buy_date')
+        sell_date = row.get('sell_date')
+        buy_qty = pd.to_numeric(row.get('buy_qty', 0), errors='coerce')
+        sell_qty = pd.to_numeric(row.get('sell_qty', 0), errors='coerce')
+        
+        if pd.notna(buy_qty) and buy_qty > 0:
+            standard_trades.append({
+                'date': pd.to_datetime(buy_date, format='%d-%m-%Y', errors='coerce').date() if pd.notna(buy_date) else pd.NaT,
+                'time': pd.NaT,
+                'symbol': sec_name,
+                'side': 'Buy',
+                'quantity': int(buy_qty),
+                'price': pd.to_numeric(row.get('avg_buy_price', 0), errors='coerce'),
+                'value': pd.to_numeric(row.get('buy_value', 0), errors='coerce'),
+                'segment': 'Equity',
+                'order_type': 'DELIVERY',
+                'exchange': 'NSE',
+                'status': 'Traded',
+            })
+        
+        if pd.notna(sell_qty) and sell_qty > 0:
+            standard_trades.append({
+                'date': pd.to_datetime(sell_date, format='%d-%m-%Y', errors='coerce').date() if pd.notna(sell_date) else pd.NaT,
+                'time': pd.NaT,
+                'symbol': sec_name,
+                'side': 'Sell',
+                'quantity': int(sell_qty),
+                'price': pd.to_numeric(row.get('avg_sell_price', 0), errors='coerce'),
+                'value': pd.to_numeric(row.get('sell_value', 0), errors='coerce'),
+                'segment': 'Equity',
+                'order_type': 'DELIVERY',
+                'exchange': 'NSE',
+                'status': 'Traded',
+            })
+    
+    return pd.DataFrame(standard_trades)

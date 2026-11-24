@@ -32,7 +32,7 @@ from core import financial_rules as fr
 from core import auth
 from core import file_storage
 from parsers import sms_parser, statement_parser, contract_note_parser, dhan_parser
-from parsers.dhan_parser import parse_dhan_trades, parse_dhan_ledger
+from parsers.dhan_parser import parse_dhan_trades, parse_dhan_ledger, parse_dhan_pnl, parse_dhan_tax_pnl, pnl_to_standard_trades, tax_pnl_to_standard_trades
 from core import dhan_reconcile
 
 try:
@@ -1470,10 +1470,12 @@ if _active == "🔗 Reconciliation":
 if _active == "🪙 Dhan Recon":
     st.caption(
         "Dhan reconciliation: Trade History (CSV) + Ledger (Excel) — matches daily trade P&L to ledger, "
-        "tracks open positions from buy/sell history, and reconciles fund deposits/withdrawals."
+        "tracks open positions from buy/sell history, and reconciles fund deposits/withdrawals. "
+        "If you don't have Trade History CSV, you can use P&L (.xls) + Tax P&L (.xls) as a fallback "
+        "(Equity trades from Tax P&L have dates; F&O from P&L gives positions & realized P&L)."
     )
     
-    st.markdown("#### Upload Trade History CSV and Ledger Excel")
+    st.markdown("#### Option 1: Trade History CSV + Ledger Excel (preferred)")
     c1, c2 = st.columns(2)
     with c1:
         trades_file = st.file_uploader("Trade History CSV", type=["csv"], key="dhan_trades_file")
@@ -1504,6 +1506,71 @@ if _active == "🪙 Dhan Recon":
         finally:
             import os
             os.unlink(trades_path)
+            os.unlink(ledger_path)
+    
+    st.divider()
+    
+    st.markdown("#### Option 2: P&L (.xls) + Tax P&L (.xls) + Ledger Excel (fallback)")
+    st.caption(
+        "Upload Dhan P&L (.xls) for F&O positions/realized P&L, "
+        "Tax P&L (.xls) for Equity trades with dates, and Ledger Excel for fund movements. "
+        "Note: P&L F&O data has no per-trade dates — uses contract info; "
+        "Tax P&L equity trades have buy/sell dates."
+    )
+    c3, c4, c5 = st.columns(3)
+    with c3:
+        pnl_file = st.file_uploader("P&L Statement (.xls)", type=["xls"], key="dhan_pnl_file")
+    with c4:
+        tax_pnl_file = st.file_uploader("Tax P&L Statement (.xls)", type=["xls"], key="dhan_tax_pnl_file")
+    with c5:
+        ledger_file2 = st.file_uploader("Ledger Statement (Excel)", type=["xls", "xlsx"], key="dhan_ledger_file2")
+    
+    if st.button("Run Recon from P&L/Tax P&L", key="dhan_pnl_run") and ledger_file2:
+        import tempfile
+        ledger_bytes = ledger_file2.getvalue()
+        with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as lf:
+            lf.write(ledger_bytes)
+            ledger_path = lf.name
+        
+        # Parse P&L and Tax P&L if provided
+        trades_list = []
+        if pnl_file:
+            with tempfile.NamedTemporaryFile(suffix='.xls', delete=False) as pf:
+                pf.write(pnl_file.getvalue())
+                pnl_path = pf.name
+            pnl_result = parse_dhan_pnl(pnl_path)
+            trades_list.append(pnl_to_standard_trades(pnl_result))
+            os.unlink(pnl_path)
+        
+        if tax_pnl_file:
+            with tempfile.NamedTemporaryFile(suffix='.xls', delete=False) as tf:
+                tf.write(tax_pnl_file.getvalue())
+                tax_path = tf.name
+            tax_result = parse_dhan_tax_pnl(tax_path)
+            trades_list.append(tax_pnl_to_standard_trades(tax_result))
+            os.unlink(tax_path)
+        
+        if trades_list:
+            import pandas as pd
+            trades_df = pd.concat(trades_list, ignore_index=True)
+            with tempfile.NamedTemporaryFile(suffix='.csv', delete=False) as tf:
+                trades_df.to_csv(tf.name, index=False)
+                trades_path = tf.name
+            
+            try:
+                from core.dhan_reconcile import run_dhan_reconciliation
+                result = run_dhan_reconciliation(
+                    trades_path=trades_path,
+                    ledger_path=ledger_path,
+                )
+                st.session_state["dhan_trades_results"] = result
+                st.success(f"Reconciliation complete using P&L/Tax P&L data ({len(trades_df)} trades).")
+            finally:
+                import os
+                os.unlink(trades_path)
+                os.unlink(ledger_path)
+        else:
+            st.error("Provide at least one of P&L or Tax P&L file.")
             os.unlink(ledger_path)
     
     # Display results
