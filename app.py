@@ -1329,13 +1329,15 @@ if _active == "📊 Reports":
 
         # ---- Portfolio value (mark-to-market from investment snapshots) ----
         st.divider()
-        st.markdown("### 💼 Portfolio Value (mark-to-market)")
+        st.markdown("### 💼 Portfolio Value (mark-to-market from 💹 Investments tab)")
         st.caption(
-            "Reports above are cash-flow P&L (money in/out). This section adds the current "
-            "mark-to-market value from the 💹 Investments tab snapshots — ULIP/MF fund values, "
-            "Dhan equity holdings and the Dhan ledger/margin balance — so you can see total "
-            "wealth, not just transactions. Record a new snapshot in the Investments tab to "
-            "update these numbers."
+            "⚠️ **This is NOT live Dhan/5paisa data.** It uses the snapshots you manually record "
+            "in the 💹 Investments tab (ULIP/MF fund NAVs, Dhan equity holdings value, "
+            "Dhan ledger/margin balance). The 'Equity (Dhan)' and 'Ledger/Margin (Dhan)' rows "
+            "below come from those snapshots' policy labels — they do NOT include Dhan's "
+            "real-time 'Available Balance / Blocked Payout / Collateral / SOD / Receivable / "
+            "Utilized / Withdrawable' ledger breakdown. Those are margin-account sub-balances, "
+            "not fund values, and are already reflected in the ledger balance snapshot."
         )
         use_snapshots = st.toggle("Use Investment snapshots for current value", value=True, key="rep_use_inv")
         if use_snapshots:
@@ -1546,7 +1548,11 @@ if _active == "🪙 Dhan Recon":
             st.markdown("### Amount Mismatches (within ₹1 tolerance)")
             st.dataframe(mismatches[['date', 'segment', 'net_value', 'ledger_net', 'diff']], use_container_width=True)
         
-        st.markdown("### Fund Movements")
+        st.markdown("### Fund Movements (Funds Deposited / Withdrawn only)")
+        st.caption("This shows only 'Funds Deposited' and 'Funds Withdrawal' rows from the Dhan ledger. "
+                   "It does NOT include Dhan's margin sub-balances (Available Balance, Blocked Payout, "
+                   "Collateral, SOD, Receivable, Utilized, Withdrawable) — those are ledger accounting "
+                   "breakdowns, not cash movements.")
         st.dataframe(result.fund_movements, use_container_width=True)
         
         st.markdown("### Current Open Positions")
@@ -1991,6 +1997,13 @@ if _active == "🏦 5paisa Recon":
         st.divider()
         st.markdown("### 📋 Missing / Pending Contract Notes")
         st.caption("Based on the note coverage scan: trading days where 5paisa had activity but no note is on disk.")
+        st.info(
+            "📌 **Note:** 2024-11-15 (Friday) and 2024-11-20 (Wednesday) were **regular trading days**, "
+            "not holidays. The missing Equity/F&O ContractNote PDFs for these dates are still pending "
+            "from 5paisa. The Nov-22 annexure proves all 8 positions rolled over to Dec-26 expiry "
+            "(BANDHANBNK 28Nov→26Dec @ 2800→170.80; MANAPPURAM 28Nov→26Dec @ 3000→152.25). "
+            "Once 5paisa provides those two notes, the 16 'unexplained' closures will resolve."
+        )
         # This would come from the note_coverage scan; for now show the known pending
         from config import note_archive
         pending = note_archive.KNOWN_PENDING.get("5paisa_huf", "")
