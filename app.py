@@ -3023,8 +3023,7 @@ def _axis_hl_excel(match: pd.DataFrame) -> bytes:
             ("Sanctioned", 6_900_000), ("Disbursed / principal", AXIS_HL_DISBURSED),
             ("Pre-EMI months", AXIS_HL_PREEMI_MONTHS), ("Pre-EMI rate on file", AXIS_HL_PREEMI_RATE),
             ("EMI since 10-Feb-2024", AXIS_HL_EMI),
-            ("Rate 13-Jul-2021", 6.80), ("Rate 27-Jan-2024", 8.50), ("Rate 26-May-2025", 8.25),
-            ("Rate 26-Jul-2025", 7.50), ("Rate 22-Oct-2025", 7.50), ("Rate 30-Oct-2026", 7.25),
+            ("Rate 13-Jul-2021", 6.80), ("Rate 27-Jan-2024", 8.50), ("Rate 25-Dec-2025", 7.25),
         ], columns=["Item", "Value"]).to_excel(xw, sheet_name="Loan and rates", index=False)
         sheet = xw.sheets["Monthly vs Kotak"]
         width = [11, 12, 26, 12, 12, 12, 11, 30, 60]
@@ -3148,9 +3147,7 @@ if _active == "🎯 Expected & Cross-Check":
                     "active": True,
                 })
                 for eff, rate in (
-                    (date(2025, 5, 26), 8.25),
-                    (date(2025, 7, 26), 7.50),
-                    (date(2026, 10, 30), 7.25),
+                    (date(2025, 12, 25), 7.25),
                 ):
                     save_rate_change({
                         "id": uuid.uuid4().hex[:16],
@@ -3160,6 +3157,7 @@ if _active == "🎯 Expected & Cross-Check":
                     })
                 st.success(
                     "Saved. EMI stays ₹50,991 when the rate changes, matching Axis. "
+                    "Rate history from bank letters: 6.80% (sanction), 8.50% (27-Jan-2024), 7.25% (25-Dec-2025). "
                     "Upload Kotak statements to match each NACH-10-DR-TP ACH ABL / NACH-10-DR-AXIS BANK debit."
                 )
                 st.rerun()
