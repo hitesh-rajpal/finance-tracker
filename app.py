@@ -577,6 +577,54 @@ if _active == "📥 Upload":
                 st.success(msg)
 
     st.divider()
+    st.subheader("🏦 Kotak savings → Axis home loan (one-click import)")
+    st.caption(
+        "Upload your Kotak savings statement PDFs (annual or monthly). This extracts only the "
+        "`NACH-10-DR-TP ACH ABL` / `NACH-10-DR-AXIS BANK` / `CLG TO AXIS BANK LTD` debits "
+        "and saves them to the database under account **Kotak 2711874925** with category **Home Loan EMI**. "
+        "Do this once — the Expected & Cross-Check section will then read from the database automatically."
+    )
+    hl_files = st.file_uploader("Kotak savings statement PDFs for Axis HL", type=["pdf"],
+                                 accept_multiple_files=True, key="kotak_hl_upl")
+    hl_pw_saved = get_pdf_passwords()
+    hl_pw_options = ["-- type a new password --"] + [p["label"] for p in hl_pw_saved]
+    hl_pw_choice = st.selectbox("Statement password", hl_pw_options, key="kotak_hl_pw_choice")
+    if hl_pw_choice != "-- type a new password --":
+        hl_pw = next(p["password"] for p in hl_pw_saved if p["label"] == hl_pw_choice)
+    else:
+        hl_pw = st.text_input("PDF password", type="password", key="kotak_hl_pw_typed")
+    if st.button("Extract & save Axis HL NACH debits", key="kotak_hl_import", type="primary"):
+        if not hl_files:
+            st.warning("Please upload at least one Kotak statement PDF.")
+        else:
+            all_rows = []
+            for f in hl_files:
+                rows = _axis_hl_scan_pdf(f.getvalue(), f.name, hl_pw or None)
+                all_rows.extend(rows)
+            if not all_rows:
+                st.warning("No Axis home-loan NACH rows found in the uploaded PDFs.")
+            else:
+                # Convert to transaction format and save
+                txn_rows = []
+                for r in all_rows:
+                    txn_rows.append({
+                        "date": r["date"],
+                        "amount": r["amount"],
+                        "direction": "debit",
+                        "description": r["narration"],
+                        "bank": "Kotak",
+                        "account": "2711874925",
+                        "category": "Home Loan EMI",
+                        "is_office": False,
+                        "source": "statement",
+                        "source_file": r["file"],
+                        "account_key": "kotak 2711874925",
+                    })
+                n, skipped = save_rows(txn_rows)
+                st.success(f"Saved {n} Axis home-loan NACH debits to the database ({skipped} already existed).")
+                st.rerun()
+
+    st.divider()
     st.subheader("Demat contract notes")
     cn_files = st.file_uploader("Contract note PDF(s)", type=["pdf"],
                                  accept_multiple_files=True, key="cn_upl")
@@ -3056,35 +3104,14 @@ if _active == "🎯 Expected & Cross-Check":
             "EMI stayed ₹50,991 and the rate cut went into principal. Use this panel for that loan."
         )
         st.markdown(
-            "**Build the match here** — upload the Kotak savings PDFs (annual file or monthly ones). "
-            "They are read in memory with the password; nothing is written to the database."
+            "**Data source:** the table below reads Axis home-loan NACH debits **from the database** "
+            "(saved via the one-click **Extract & save Axis HL NACH debits** button in the 📥 Upload tab). "
+            "If the database is empty, upload PDFs here as a fallback."
         )
-        hl_pw_saved = get_pdf_passwords()
-        hl_pw_options = ["-- type a new password --"] + [p["label"] for p in hl_pw_saved]
-        hl_pw_choice = st.selectbox("Statement password", hl_pw_options, key="axis_hl_pw_choice")
-        if hl_pw_choice != "-- type a new password --":
-            hl_pw = next(p["password"] for p in hl_pw_saved if p["label"] == hl_pw_choice)
-        else:
-            hl_pw = st.text_input("PDF password (Kotak statements)", type="password", key="axis_hl_pw_typed")
-        hl_files = st.file_uploader(
-            "Kotak savings statement PDFs", type=["pdf"], accept_multiple_files=True, key="axis_hl_pdfs"
-        )
-        if st.button("Match uploaded statements", key="axis_hl_scan", type="primary"):
-            hl_rows: list[dict] = []
-            hl_errs: list[str] = []
-            for f in hl_files or []:
-                try:
-                    hl_rows.extend(_axis_hl_scan_pdf(f.getvalue(), f.name, hl_pw or None))
-                except Exception as exc:  # wrong password, unreadable scan, etc.
-                    hl_errs.append(f"{f.name}: {type(exc).__name__}")
-            st.session_state.axis_hl_rows = hl_rows
-            st.session_state.axis_hl_errs = hl_errs
 
-        hl_rows = list(st.session_state.get("axis_hl_rows") or [])
-        for msg in st.session_state.get("axis_hl_errs") or []:
-            st.warning(f"Could not read {msg}. Check the password for that file.")
-
+        # First, try to load from database
         hl_df = load_df()
+        hl_rows = []
         if not hl_df.empty:
             db_debits = hl_df[hl_df["direction"] == "debit"]
             for _, r in db_debits.iterrows():
@@ -3093,6 +3120,37 @@ if _active == "🎯 Expected & Cross-Check":
                 if _is_axis_home_loan_debit(desc, amt):
                     hl_rows.append({"date": pd.to_datetime(r["date"]).date(), "amount": amt,
                                     "narration": desc, "file": "app database"})
+
+        # Fallback: manual PDF upload if DB is empty or user wants to supplement
+        if not hl_rows:
+            st.info("No Axis HL NACH debits found in the database yet. Upload PDFs below or use the one-click import in the 📥 Upload tab.")
+            hl_pw_saved = get_pdf_passwords()
+            hl_pw_options = ["-- type a new password --"] + [p["label"] for p in hl_pw_saved]
+            hl_pw_choice = st.selectbox("Statement password", hl_pw_options, key="axis_hl_pw_choice")
+            if hl_pw_choice != "-- type a new password --":
+                hl_pw = next(p["password"] for p in hl_pw_saved if p["label"] == hl_pw_choice)
+            else:
+                hl_pw = st.text_input("PDF password (Kotak statements)", type="password", key="axis_hl_pw_typed")
+            hl_files = st.file_uploader(
+                "Kotak savings statement PDFs (fallback)", type=["pdf"], accept_multiple_files=True, key="axis_hl_pdfs"
+            )
+            if st.button("Match uploaded statements", key="axis_hl_scan", type="primary"):
+                hl_rows_scan: list[dict] = []
+                hl_errs: list[str] = []
+                for f in hl_files or []:
+                    try:
+                        hl_rows_scan.extend(_axis_hl_scan_pdf(f.getvalue(), f.name, hl_pw or None))
+                    except Exception as exc:
+                        hl_errs.append(f"{f.name}: {type(exc).__name__}")
+                for msg in hl_errs:
+                    st.warning(f"Could not read {msg}. Check the password for that file.")
+                hl_rows.extend(hl_rows_scan)
+                st.session_state.axis_hl_rows = hl_rows_scan  # cache for this session
+            else:
+                # Use cached rows from session state if available
+                hl_rows.extend(st.session_state.get("axis_hl_rows") or [])
+        else:
+            st.success(f"Loaded {len(hl_rows)} Axis HL NACH debits from the database.")
 
         seen: set = set()
         uniq_rows = []
