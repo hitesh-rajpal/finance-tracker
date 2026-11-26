@@ -2889,6 +2889,165 @@ def _is_axis_home_loan_debit(description: str, amount: float) -> bool:
     return "NACH" in text and "AXIS" in text and 30000 <= float(amount or 0) <= 60000
 
 
+AXIS_HL_EMI = 50_991.0
+AXIS_HL_DISBURSED = 5_872_500.0
+AXIS_HL_PREEMI_RATE = 6.80
+AXIS_HL_FIRST_DUE = date(2021, 8, 10)
+AXIS_HL_FIRST_EMI = date(2024, 2, 10)
+AXIS_HL_PREEMI_MONTHS = 30
+_AXIS_HL_LINE = re.compile(r"NACH-10-DR-(?:TP ACH ABL|AXIS BANK)|CLG TO AXIS BANK", re.I)
+_AXIS_HL_AMOUNT = re.compile(r"(-?\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?)(\(Dr\)|\(Cr\))?")
+
+
+def _axis_hl_add_month(d: date, n: int = 1) -> date:
+    m = d.month - 1 + n
+    return date(d.year + m // 12, m % 12 + 1, d.day)
+
+
+def _axis_hl_schedule(upto: date) -> pd.DataFrame:
+    """What the loan file says should have been paid: 30 interest-only
+    pre-EMIs at the original 6.80% on the disbursed Rs 58,72,500, then the
+    Rs 50,991 instalment Axis actually charged from 10-Feb-2024."""
+    rows = []
+    prev = date(2021, 7, 10)
+    for i in range(AXIS_HL_PREEMI_MONTHS):
+        due = _axis_hl_add_month(AXIS_HL_FIRST_DUE, i)
+        days = (due - prev).days
+        rows.append({
+            "Instalment": len(rows) + 1, "Due": due, "Days": days, "Type": "Pre-EMI (interest only)",
+            "Expected": round(AXIS_HL_DISBURSED * AXIS_HL_PREEMI_RATE / 100 * days / 365),
+        })
+        prev = due
+    due = AXIS_HL_FIRST_EMI
+    while due <= upto:
+        rows.append({
+            "Instalment": len(rows) + 1, "Due": due, "Days": None, "Type": "EMI (principal + interest)",
+            "Expected": AXIS_HL_EMI,
+        })
+        due = _axis_hl_add_month(due)
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False, max_entries=50)
+def _axis_hl_scan_pdf(data: bytes, name: str, password: str | None) -> list[dict]:
+    """Pull the Axis loan rows out of one Kotak statement PDF."""
+    import pdfplumber
+    out: list[dict] = []
+    with pdfplumber.open(io.BytesIO(data), password=password) as pdf:
+        for page in pdf.pages:
+            for line in (page.extract_text() or "").splitlines():
+                if not _AXIS_HL_LINE.search(line):
+                    continue
+                when = None
+                for pat in (r"(\d{1,2}[-/ ]\w{3}[-/ ,]{1,2}\d{2,4})", r"(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})"):
+                    m = re.search(pat, line)
+                    if m:
+                        try:
+                            when = pd.to_datetime(m.group(1).replace(",", " ").replace("  ", " "), dayfirst=True).date()
+                            break
+                        except Exception:
+                            when = None
+                if when is None:
+                    continue
+                amounts = [(m.group(1), m.group(2)) for m in _AXIS_HL_AMOUNT.finditer(line)]
+                if not amounts:
+                    continue
+                debits = [a for a, tag in amounts if tag and tag.lower() == "(dr)"]
+                raw = debits[0] if debits else amounts[0][0]
+                try:
+                    amount = abs(float(raw.replace(",", "")))
+                except ValueError:
+                    continue
+                if not 1000 <= amount <= 200000:
+                    continue
+                out.append({"date": when, "amount": amount, "narration": line.strip(), "file": name})
+    return out
+
+
+def _axis_hl_match(bank_rows: list[dict], upto: date | None = None) -> pd.DataFrame:
+    upto = upto or max([r["date"] for r in bank_rows] + [date.today()])
+    schedule = _axis_hl_schedule(max(upto, max(r["date"] for r in bank_rows)))
+    rows = []
+    for _, s in schedule.iterrows():
+        due = s["Due"]
+        same_month = [
+            r for r in bank_rows
+            if r["date"].year == due.year and r["date"].month == due.month
+        ]
+        if s["Type"].startswith("EMI"):
+            hit = next((r for r in same_month if abs(r["amount"] - AXIS_HL_EMI) <= 1), same_month[0] if same_month else None)
+        else:
+            hit = min(same_month, key=lambda r: abs(r["date"] - due)) if same_month else None
+        if not hit:
+            status = "Not in uploaded statements"
+            rows.append({
+                "Instalment": s["Instalment"], "Due": due, "Type": s["Type"], "Expected": s["Expected"],
+                "Bank date": None, "Bank amount": None, "Difference": None, "Status": status, "Narration": "",
+            })
+            continue
+        diff = round(hit["amount"] - s["Expected"], 2)
+        if s["Type"].startswith("EMI"):
+            status = "MATCHED" if abs(diff) <= 1 else "AMOUNT DIFFERS"
+            if diff > 1:
+                status = "PAID ABOVE EXPECTED"
+        else:
+            status = "MATCHED" if abs(diff) <= 1 else ("PAID ABOVE 6.80% SCHEDULE" if diff > 1 else "PAID BELOW 6.80% SCHEDULE")
+        rows.append({
+            "Instalment": s["Instalment"], "Due": due, "Type": s["Type"], "Expected": s["Expected"],
+            "Bank date": hit["date"], "Bank amount": hit["amount"], "Difference": diff,
+            "Status": status, "Narration": hit["narration"][:90],
+        })
+    return pd.DataFrame(rows)
+
+
+def _axis_hl_row_style(row):
+    status = str(row.get("Status", ""))
+    if status == "MATCHED":
+        css = "background-color: #C6EFCE"
+    elif status.startswith("PAID"):
+        css = "background-color: #FFF2CC"
+    else:
+        css = "background-color: #F2F2F2; color: #777"
+    return [css] * len(row)
+
+
+def _axis_hl_excel(match: pd.DataFrame) -> bytes:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        match.to_excel(xw, sheet_name="Monthly vs Kotak", index=False)
+        pd.DataFrame([
+            ("Sanctioned", 6_900_000), ("Disbursed / principal", AXIS_HL_DISBURSED),
+            ("Pre-EMI months", AXIS_HL_PREEMI_MONTHS), ("Pre-EMI rate on file", AXIS_HL_PREEMI_RATE),
+            ("EMI since 10-Feb-2024", AXIS_HL_EMI),
+            ("Rate 13-Jul-2021", 6.80), ("Rate 27-Jan-2024", 8.50), ("Rate 26-May-2025", 8.25),
+            ("Rate 26-Jul-2025", 7.50), ("Rate 22-Oct-2025", 7.50), ("Rate 30-Oct-2026", 7.25),
+        ], columns=["Item", "Value"]).to_excel(xw, sheet_name="Loan and rates", index=False)
+        sheet = xw.sheets["Monthly vs Kotak"]
+        width = [11, 12, 26, 12, 12, 12, 11, 30, 60]
+        for i, w in enumerate(width, 1):
+            sheet.column_dimensions[get_column_letter(i)].width = w
+        head = PatternFill("solid", fgColor="1F4E79")
+        for cell in sheet[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = head
+            cell.alignment = Alignment(wrap_text=True)
+        for r in range(2, sheet.max_row + 1):
+            status = sheet.cell(r, 8).value or ""
+            fill = "C6EFCE" if status == "MATCHED" else ("FFF2CC" if str(status).startswith("PAID") else "F2F2F2")
+            for c in (1, 2, 4, 5, 6, 7, 8):
+                sheet.cell(r, c).fill = PatternFill("solid", fgColor=fill)
+            sheet.cell(r, 2).number_format = "DD-MMM-YYYY"
+            sheet.cell(r, 5).number_format = "DD-MMM-YYYY"
+            for c in (4, 6, 7):
+                sheet.cell(r, c).number_format = "#,##0"
+        sheet.freeze_panes = "A2"
+    return buf.getvalue()
+
+
 if _active == "🎯 Expected & Cross-Check":
     with st.expander("🏠 Axis home loan PHR065206289041 — match Kotak NACH to the schedule", expanded=False):
         st.caption(
@@ -2897,28 +3056,80 @@ if _active == "🎯 Expected & Cross-Check":
             "The generic Loan EMI rule below refixes the EMI when the rate changes. Axis did not: "
             "EMI stayed ₹50,991 and the rate cut went into principal. Use this panel for that loan."
         )
-        hl_df = load_df()
-        if hl_df.empty:
-            st.info("No bank transactions in the app yet. Upload the Kotak savings statements in the Upload tab, then come back.")
+        st.markdown(
+            "**Build the match here** — upload the Kotak savings PDFs (annual file or monthly ones). "
+            "They are read in memory with the password; nothing is written to the database."
+        )
+        hl_pw_saved = get_pdf_passwords()
+        hl_pw_options = ["-- type a new password --"] + [p["label"] for p in hl_pw_saved]
+        hl_pw_choice = st.selectbox("Statement password", hl_pw_options, key="axis_hl_pw_choice")
+        if hl_pw_choice != "-- type a new password --":
+            hl_pw = next(p["password"] for p in hl_pw_saved if p["label"] == hl_pw_choice)
         else:
-            debits = hl_df[hl_df["direction"] == "debit"].copy()
-            debits = debits[debits.apply(lambda r: _is_axis_home_loan_debit(str(r.get("description") or ""), r.get("amount") or 0), axis=1)]
-            if debits.empty:
-                st.warning(
-                    "No Axis home-loan NACH rows are in the app database yet. "
-                    "The PDF match is in Axis_HomeLoan_BankMatch_PHR065206289041.xlsx. "
-                    "Upload Kotak account 2711874925 here to match inside the app."
-                )
-            else:
-                debits = debits.sort_values("date")
-                show = debits[["date", "amount", "description", "account"]].copy()
-                show["expected_emi"] = show["amount"].apply(lambda a: 50991 if abs(float(a) - 50991) < 1 else None)
-                show["status"] = show["amount"].apply(
-                    lambda a: "MATCHED EMI" if abs(float(a) - 50991) < 1 else "Pre-EMI or other Axis loan debit"
-                )
-                st.dataframe(show, use_container_width=True, hide_index=True)
-                matched_n = int((show["status"] == "MATCHED EMI").sum())
-                st.caption(f"{len(show)} Axis loan debit(s) in the database, {matched_n} at the ₹50,991 EMI.")
+            hl_pw = st.text_input("PDF password (Kotak statements)", type="password", key="axis_hl_pw_typed")
+        hl_files = st.file_uploader(
+            "Kotak savings statement PDFs", type=["pdf"], accept_multiple_files=True, key="axis_hl_pdfs"
+        )
+        if st.button("Match uploaded statements", key="axis_hl_scan", type="primary"):
+            hl_rows: list[dict] = []
+            hl_errs: list[str] = []
+            for f in hl_files or []:
+                try:
+                    hl_rows.extend(_axis_hl_scan_pdf(f.getvalue(), f.name, hl_pw or None))
+                except Exception as exc:  # wrong password, unreadable scan, etc.
+                    hl_errs.append(f"{f.name}: {type(exc).__name__}")
+            st.session_state.axis_hl_rows = hl_rows
+            st.session_state.axis_hl_errs = hl_errs
+
+        hl_rows = list(st.session_state.get("axis_hl_rows") or [])
+        for msg in st.session_state.get("axis_hl_errs") or []:
+            st.warning(f"Could not read {msg}. Check the password for that file.")
+
+        hl_df = load_df()
+        if not hl_df.empty:
+            db_debits = hl_df[hl_df["direction"] == "debit"]
+            for _, r in db_debits.iterrows():
+                desc = str(r.get("description") or "")
+                amt = float(r.get("amount") or 0)
+                if _is_axis_home_loan_debit(desc, amt):
+                    hl_rows.append({"date": pd.to_datetime(r["date"]).date(), "amount": amt,
+                                    "narration": desc, "file": "app database"})
+
+        seen: set = set()
+        uniq_rows = []
+        for r in hl_rows:
+            key = (r["date"], round(float(r["amount"]), 2))
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq_rows.append(r)
+
+        if not uniq_rows:
+            st.info(
+                "Upload the Kotak PDFs above, or import the statements in the Upload tab. "
+                "Without statements there is nothing to compare. "
+                "The same match is already in Axis_HomeLoan_BankMatch_PHR065206289041.xlsx."
+            )
+        else:
+            hl_match = _axis_hl_match(uniq_rows)
+            st.dataframe(
+                hl_match.style.apply(_axis_hl_row_style, axis=1),
+                use_container_width=True, hide_index=True,
+            )
+            matched_n = int((hl_match["Status"] == "MATCHED").sum())
+            higher_n = int(hl_match["Status"].str.startswith("PAID").sum())
+            missing_n = int(hl_match["Status"].str.startswith("Not in").sum())
+            st.caption(
+                f"{len(hl_match)} instalments: {matched_n} matched, {higher_n} paid above the 6.80% pre-EMI schedule, "
+                f"{missing_n} not in the uploaded statements."
+            )
+            st.download_button(
+                "⬇️ Download this match (Excel)",
+                _axis_hl_excel(hl_match),
+                file_name=f"Axis_HomeLoan_Match_{date.today().isoformat()}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="axis_hl_dl",
+            )
             if st.button("Import this loan into Expected rules", key="import_axis_hl"):
                 rule_id = fr.make_rule_id("Axis Home Loan PHR065206289041", "Loan EMI")
                 save_rule({
