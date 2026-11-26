@@ -44,16 +44,15 @@ def _emi_for(balance: float, annual_rate: float, remaining_months: int) -> float
 
 
 def amortization_schedule(principal: float, annual_rate: float, tenure_months: int, start_date,
-                           rate_changes: list[dict] | None = None) -> pd.DataFrame:
+                           rate_changes: list[dict] | None = None, refix_emi: bool = True) -> pd.DataFrame:
     """Standard reducing-balance EMI schedule. start_date is the first EMI's date.
 
     rate_changes (optional): [{'effective_month': int, 'new_annual_rate': float}, ...] —
-    a floating-rate loan's rate resets. At each effective_month, the EMI is
-    recalculated on the outstanding balance at that point, for whatever tenure
-    remains (tenure_months is fixed — this recalculates the EMI amount to
-    match your bank's usual convention of keeping the payoff date fixed and
-    adjusting the installment, not the other way around). effective_month
-    counts from 1 (the first EMI), same numbering as the 'month' column below.
+    a floating-rate loan's rate resets. If refix_emi is True (default), the EMI is
+    recalculated on the outstanding balance for the remaining tenure, keeping the
+    payoff date fixed. If False, the EMI stays at the original amount and a rate
+    cut increases the principal portion (Axis home loan PHR065206289041 does this:
+    EMI stayed Rs 50,991 after the rate fell). effective_month counts from 1.
     """
     start_date = pd.to_datetime(start_date)
     rate_changes = sorted(rate_changes or [], key=lambda c: c["effective_month"])
@@ -66,7 +65,8 @@ def amortization_schedule(principal: float, annual_rate: float, tenure_months: i
     for m in range(1, tenure_months + 1):
         if m in change_at:
             current_rate = change_at[m]
-            emi = _emi_for(balance, current_rate, tenure_months - m + 1)
+            if refix_emi:
+                emi = _emi_for(balance, current_rate, tenure_months - m + 1)
         r = (current_rate / 12) / 100
         interest = balance * r
         principal_component = min(emi - interest, balance)
@@ -102,7 +102,7 @@ def period_bounds(frequency: str, target_date):
 
 
 def expected_amount(rule: dict, period_start, period_end, actual_df: pd.DataFrame,
-                     rate_changes: list[dict] | None = None) -> float | None:
+                     rate_changes: list[dict] | None = None, refix_emi: bool = True) -> float | None:
     rule_type = rule["rule_type"]
 
     if rule_type == "Interest":
@@ -131,7 +131,7 @@ def expected_amount(rule: dict, period_start, period_end, actual_df: pd.DataFram
             return None
         schedule = amortization_schedule(
             rule["principal"], rule.get("annual_rate") or 0, int(rule["tenure_months"]), rule["start_date"],
-            rate_changes=rate_changes,
+            rate_changes=rate_changes, refix_emi=refix_emi,
         )
         sched_dates = pd.to_datetime(schedule["date"])
         window = schedule[(sched_dates >= pd.to_datetime(period_start)) & (sched_dates <= pd.to_datetime(period_end))]
@@ -152,9 +152,9 @@ def _expected_direction(rule: dict) -> str:
 
 
 def cross_check(rule: dict, actual_df: pd.DataFrame, period_start, period_end, tolerance_pct: float = 0.05,
-                 rate_changes: list[dict] | None = None) -> dict:
+                 rate_changes: list[dict] | None = None, refix_emi: bool = True) -> dict:
     """Returns expected/actual amounts and a Matched/Mismatch/Missing/Unknown status."""
-    expected = expected_amount(rule, period_start, period_end, actual_df, rate_changes=rate_changes)
+    expected = expected_amount(rule, period_start, period_end, actual_df, rate_changes=rate_changes, refix_emi=refix_emi)
     direction = _expected_direction(rule)
 
     matches = pd.DataFrame()

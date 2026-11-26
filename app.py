@@ -2879,7 +2879,80 @@ if _active == "💹 Investments":
                 st.dataframe(pd.DataFrame([x for x in snap_data if x["id"] == latest_snap["id"] and x["fund_name"]]), use_container_width=True)
 
 # ------------------------------------------------- Expected & Cross-Check -
+def _is_axis_home_loan_debit(description: str, amount: float) -> bool:
+    """Kotak narration for the Axis home-loan instalment. The user's statement
+    shows it as 'NACH-10-DR-TP ACH ABL-...' (later 'NACH-10-DR-AXIS BANK-')
+    for Rs 50,991. Other Axis UPI rows are not the loan."""
+    text = (description or "").upper()
+    if "ACH ABL" in text or "NACH-10-DR-AXIS" in text or "CLG TO AXIS BANK LTD" in text:
+        return True
+    return "NACH" in text and "AXIS" in text and 30000 <= float(amount or 0) <= 60000
+
+
 if _active == "🎯 Expected & Cross-Check":
+    with st.expander("🏠 Axis home loan PHR065206289041 — match Kotak NACH to the schedule", expanded=False):
+        st.caption(
+            "EMI in the Kotak statement looks like `10 Aug 2024 NACH-10-DR-TP ACH ABL-... -50,991.00`. "
+            "From 2025 the same debit is worded `NACH-10-DR-AXIS BANK`. "
+            "The generic Loan EMI rule below refixes the EMI when the rate changes. Axis did not: "
+            "EMI stayed ₹50,991 and the rate cut went into principal. Use this panel for that loan."
+        )
+        hl_df = load_df()
+        if hl_df.empty:
+            st.info("No bank transactions in the app yet. Upload the Kotak savings statements in the Upload tab, then come back.")
+        else:
+            debits = hl_df[hl_df["direction"] == "debit"].copy()
+            debits = debits[debits.apply(lambda r: _is_axis_home_loan_debit(str(r.get("description") or ""), r.get("amount") or 0), axis=1)]
+            if debits.empty:
+                st.warning(
+                    "No Axis home-loan NACH rows are in the app database yet. "
+                    "The PDF match is in Axis_HomeLoan_BankMatch_PHR065206289041.xlsx. "
+                    "Upload Kotak account 2711874925 here to match inside the app."
+                )
+            else:
+                debits = debits.sort_values("date")
+                show = debits[["date", "amount", "description", "account"]].copy()
+                show["expected_emi"] = show["amount"].apply(lambda a: 50991 if abs(float(a) - 50991) < 1 else None)
+                show["status"] = show["amount"].apply(
+                    lambda a: "MATCHED EMI" if abs(float(a) - 50991) < 1 else "Pre-EMI or other Axis loan debit"
+                )
+                st.dataframe(show, use_container_width=True, hide_index=True)
+                matched_n = int((show["status"] == "MATCHED EMI").sum())
+                st.caption(f"{len(show)} Axis loan debit(s) in the database, {matched_n} at the ₹50,991 EMI.")
+            if st.button("Import this loan into Expected rules", key="import_axis_hl"):
+                rule_id = fr.make_rule_id("Axis Home Loan PHR065206289041", "Loan EMI")
+                save_rule({
+                    "id": rule_id,
+                    "name": "Axis Home Loan PHR065206289041",
+                    "rule_type": "Loan EMI",
+                    "counterparty_type": "Bank",
+                    "counterparty_name": "Axis Bank",
+                    "account_key": None,
+                    "match_category": "Home Loan EMI",
+                    "principal": 5872500,
+                    "annual_rate": 7.70,
+                    "tenure_months": 210,
+                    "start_date": date(2024, 2, 10),
+                    "frequency": "Monthly",
+                    "active": True,
+                })
+                for eff, rate in (
+                    (date(2025, 5, 26), 8.25),
+                    (date(2025, 7, 26), 7.50),
+                    (date(2026, 10, 30), 7.25),
+                ):
+                    save_rate_change({
+                        "id": uuid.uuid4().hex[:16],
+                        "rule_id": rule_id,
+                        "effective_date": eff,
+                        "new_annual_rate": rate,
+                    })
+                st.success(
+                    "Saved. EMI stays ₹50,991 when the rate changes, matching Axis. "
+                    "Upload Kotak statements to match each NACH-10-DR-TP ACH ABL / NACH-10-DR-AXIS BANK debit."
+                )
+                st.rerun()
+
     st.caption(
         "Define what you EXPECT — savings interest at a rate, credit-card cashback at a rate, "
         "a loan on its own amortization schedule, or any other fixed recurring transfer with a "
@@ -2962,7 +3035,9 @@ if _active == "🎯 Expected & Cross-Check":
                 stored_changes = get_rate_changes(rule["id"])
                 if stored_changes:
                     rc = fr.rate_changes_for_schedule(rule["start_date"], stored_changes)
-            result = fr.cross_check(rule, df, period_start, period_end, rate_changes=rc)
+            # Axis kept the EMI at Rs 50,991 when the rate fell. Other loans still refix.
+            keep_emi = "PHR065206289041" in (rule.get("name") or "")
+            result = fr.cross_check(rule, df, period_start, period_end, rate_changes=rc, refix_emi=not keep_emi)
             rows_out.append({
                 "Name": rule["name"],
                 "Type": rule["rule_type"],
@@ -3019,6 +3094,7 @@ if _active == "🎯 Expected & Cross-Check":
                     schedule = fr.amortization_schedule(
                         rule["principal"], rule.get("annual_rate") or 0,
                         int(rule["tenure_months"]), rule["start_date"], rate_changes=rc,
+                        refix_emi="PHR065206289041" not in (rule.get("name") or ""),
                     )
                     st.dataframe(schedule, use_container_width=True, height=250)
 
